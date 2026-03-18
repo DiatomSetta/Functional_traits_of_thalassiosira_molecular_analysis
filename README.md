@@ -1,4 +1,4 @@
-# Molecular analysis files associated with 'Functional Traits of Thalassiosira..." manuscript
+## Molecular analysis files associated with 'Functional Traits of Thalassiosira..." manuscript
 Scripts and log files from molecular analysis of 5 samples on the Dyson 2022 EcoFOCI Spring mooring cruise
 
 ### Files included in repository:
