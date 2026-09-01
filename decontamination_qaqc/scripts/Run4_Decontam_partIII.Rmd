@@ -1,0 +1,873 @@
+---
+title: "Run1 OME Taxonomy Comparison Decontamination PartIII"
+author: "Sam Setta"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Goal of Script
+
+Set filtering method for ASV decontamination, steps we decided on:
+
+**Part I Processing steps**
+
+ * Step 1: Merge reads only (DONE)
+ * Step 2: Tag jumping/index hopping
+ * Step 3: Remove negative control contaminants.
+ * Step 4: Remove the positive and negative control samples.
+ * Step 5: Remove known contaminants (human, food products, pets, lab controls, etc.). Remove off-targets (i.e. taxonomic: bacteria/archaea in the MiFish; or length based). Leave in unknowns.
+
+Produce Part I filtered output file
+
+**Part II: Merge with other runs if neccessary**
+
+**Part III Processing steps - THIS SCRIPT**
+
+ * Step 6: Extreme low sample depth pass (# reads < number dependent on platform)
+ * Step 7: Extreme low diversity pass (remove sample with one ASV > 99.9% of the sample).
+ * Step 8: Dissimilarity between PCR (biological) replicates [Sample Filtering]
+
+Produce Part III filtered output file
+
+**Part IV Processing steps**
+
+ * Step 9: Remove singletons [helps computational load]
+ * Step 10: Pattern of Presence (remove ASVs only found in one sample or user value) or Site Occupancy Modeling [ASV filtering]
+ * Step 11: Remove n-ton (user defined ASV min) [ASV filtering]
+ * Step 12: Removing low complexity samples x% one ASV [Sample filtering]. User defined (optional).
+ * Step 13: Remove unknowns (optional) [ASV filtering]
+ * Step 14: Low sample depth pass/discard PCR replicates of low depth (aka 40k or confidence %) [Sample Filtering]
+
+Produce Part IV filtered output file
+
+Following: https://github.com/zjgold/gruinard_decon
+
+More details on how each works copied for the Readme:
+
+**Estimation of Tag-jumping or Index Hopping**
+
+With this procedure, we substract the proportion of reads that jumped into control samples from each environmental sample. First we determine which ASVs came from controls vs environmental samples. Next we create a vector of ASVs in positive controls. We then calculate what proportion of the reads found in the positive controls are found in environment samples. Next, we substract the composition of the positive controls from the environment samples. The idea behind this procedure is that we now know how many reads from each ASV appeared in the controls. These come from 2 processes: sequences we know should appear in the positive controls, and sequences that have hopped from the environment to the positive controls.
+
+**Discarding PCR replicates with low number of reads**
+We fit the sample read depth to a beta distribution. We then discard samples below the 5% probability level.
+
+**Site Occupancy Modeling**
+Site occupancy modeling is used to asses whether an ASV is a true rare sequence or likely contaminant. We first identify the pattern of presence of each ASV across biological and technical replicates. We then estimate the occupancy probability of each ASV pattern across replicates based on the pattern of presesence across all samples. We then filter out ASVs with low occupancy probabilities.
+
+For our purposes, since we don't have 'site' occupancy, can filter at a certain read number across a certain number of samples.
+
+Load libraries
+
+```{r setup, warning=FALSE, message=FALSE}
+# install libraries
+# BiocManager::install(c("tidyverse", "lubridate", "RColorBrewer", "ggsci", "dplyr", "phyloseq", "knitr", "readxl","ggplot2","NatParksPalettes","purrr", "ggvenn", "zetadiv"))
+
+library("tidyverse")
+# library("ggplot2") loads with tidyverse
+# library("stringr") loads with tidyverse
+# library("dplyr") loads with tidyverse
+# library("tibble") loads with tidyverse
+library("proxy")
+library("reshape2")
+library("microDecon")
+library("knitr")
+library("vegan")
+library("phyloseq")
+library("DESeq2")
+library("ape")
+library("RColorBrewer")
+library("ggsci")
+library("knitr")
+library("readxl")
+library("here")
+# packages I don't think I'll use:
+# library("ranacapa")
+# library("plotly")
+library("optparse")
+# BiocManager::install("fitdistrplus")
+library("fitdistrplus")
+# library("rstan")
+# library("shinystan")
+# library("bayesplot")
+# library("broom")
+library("configr")
+library("Biostrings")
+library("NatParksPalettes")
+library("ggforce")
+library("ggrepel")
+# library("zetadiv")
+here()
+
+source(here("SKQ_Alaska_Analysis","SKQ_Alaska_scripts","decontamination","decontamination_utilities.R"))
+
+```
+
+## Set-Up for decontamination
+
+### Load config file for processing.
+
+```{r warning=FALSE, message=FALSE}
+# load config file of variables for script
+option_list <- list(
+  make_option(c("-c", "--config"), type="character", default="decontam_post-merge_18Sv4.yaml",
+              help="Path to configuration file [default %default]", metavar="FILE")
+)
+
+opt_parser <- OptionParser(option_list=option_list)
+opt <- parse_args(opt_parser)
+# check if yaml
+is.yaml.file(opt$config)
+eval.config.sections(opt$config)
+config_file <- read.config(opt$config)
+
+```
+
+### Load data
+
+```{r warning=FALSE, message=FALSE}
+# Load summary ASV file:
+ASV.summary<- readRDS(here(config_file$parent_dir,
+      config_file$output_path,
+      "Output_R","ASV.summary_final_partII.RDS"))
+
+# Load nested ASV file:
+ASV.nested <- readRDS(here(
+      config_file$parent_dir,
+      config_file$output_path,"Output_R","ASV.nested_final_partII.RDS")) %>% ungroup()
+
+# load metadata file: (period in sample name rather than underscore)
+metadata_file <- read_csv(here(config_file$parent_dir,
+                               config_file$output_path,
+                               "Output_csv",config_file$input_meta_file_partIII)) %>%
+  mutate(sample_derived_from=str_extract(samp_name, "^E(\\d+)"),
+         rep=case_when(str_detect(samp_name, "_(\\d+)T") ~ str_match(samp_name, "_(\\d+)T")[,2],
+                       str_detect(samp_name, "_(\\d+)B") ~ str_match(samp_name, "_(\\d+)B")[,2],
+                       TRUE ~ NA),
+         rep_type=case_when(str_detect(samp_name, "_(\\d+)T") ~ "T",
+                            str_detect(samp_name, "_(\\d+)B") ~ "B",
+                            TRUE ~ NA),
+         pcr_rep=str_match(samp_name, "_PCR(\\d+)")[,2])
+
+# ASV merged file from partII:
+ASV_merged<-
+      ASV.nested %>% 
+      unnest(Sample) %>%
+      pivot_wider( # pivot wider so read counts are now below each sample name
+        names_from = sample,
+        values_from = reads,
+        values_fill = list(reads = 0)
+      )
+
+```
+
+## Step 6: Extreme low sample depth pass
+
+### Pull out Sample Read Depth
+
+```{r warning=FALSE, message=FALSE}
+# Get the summary of total ASVs per region per sample
+all.reps <- ASV.nested %>%
+  dplyr::select(Miseq_region, Sample) %>%
+  unnest(Sample) %>%
+  group_by(Miseq_region, sample) %>%
+  dplyr::summarise(tot = sum(reads)) %>%
+  arrange(desc(tot)) %>% ungroup()
+
+# Calculate reads per sample:
+reads.per.sample <- all.reps %>%
+  filter(., tot > 100) %>%
+  pull(tot)
+
+names(reads.per.sample) <- all.reps %>%
+  filter(., tot > 100) %>%
+  pull(sample)
+```
+
+### Normal distribution of reads:
+
+```{r warning=FALSE, message=FALSE}
+### Fit Normal Distribution
+fit <- fitdist(
+  reads.per.sample,
+  "gamma",
+  lower = c(0, 0),
+  start = list(scale = 1, shape = 1)
+)
+
+all.reps <- all.reps %>%
+  mutate(prob = pgamma(
+    tot,
+    shape = fit$estimate[[2]],
+    scale = fit$estimate[[1]],
+    lower.tail = TRUE,
+    log.p = FALSE
+  )) %>% ungroup()
+
+### Remove Outlier Samples
+outliers <- all.reps %>%
+  filter(tot < config_file$step6_minimum_read_cutoff)
+
+## what would be removed if used probability:
+all.reps %>%
+  mutate(
+    .,
+    Sequencing_depth_flag = if_else(
+      prob < config_file$step6_low_dist_probability_cutoff, 
+      # changed to 0.05 to save the two samples
+      "Warning Low Read Depth",
+      "Ok"
+    )
+  ) %>%
+  filter(., Sequencing_depth_flag != "Ok")
+
+## Add to ASV.nested
+ASV.nested <- ASV.nested %>%
+  mutate(Step.6.low.read.depth = purrr::map(Sample, ~ filter(., !sample %in% outliers$sample) %>%
+        left_join(all.reps) %>%
+          ungroup() %>%
+        dplyr::select(-c("Miseq_region")) %>%
+        mutate(Sequencing_depth_flag = if_else(
+            prob < config_file$step6_low_dist_probability_cutoff,
+            "Warning Low Read Depth",
+            "Ok"))
+    )
+  )
+
+```
+
+Summary file of low reads:
+
+```{r warning=FALSE, message=FALSE}
+### Summary.file
+ASV.summary <- 
+  ASV.nested %>%
+  dplyr::mutate(Miseq_region, Summary.1 = purrr::map(
+      Step.6.low.read.depth,
+      ~ how.many(ASVtable = ., round = "6.Low.Read.Depth")), .keep="none") %>%
+  left_join(ASV.summary) %>%
+  mutate(Summary = map2(Summary, Summary.1, bind_rows)) %>%
+  dplyr::select(-Summary.1)
+
+ASV.summary$Summary
+
+
+```
+
+## Step 7: Extreme low diversity pass 
+
+Remove sample with one ASV > 99.9% of the sample.
+
+```{r warning=FALSE, message=FALSE}
+## Identify samples that have greater than 99% of ASVs
+asv_prop <- ASV.nested %>%
+    dplyr::select(Step.6.low.read.depth) %>% # extreme low read depth samples removed
+    unnest(Step.6.low.read.depth) %>% # unnest tibble to work with
+    dplyr::select(seq_id, reads, sample) %>% # select only necessary columns
+    pivot_wider( # pivot wider so read counts are now below each sample name
+      names_from = sample,
+      values_from = reads,
+      values_fill = list(reads = 0)
+    ) %>% 
+  # calculate the porportion each ASV makes of the the total reads per sample
+  mutate(across(-c("seq_id"), ~ .x/sum(.x))) %>%
+  pivot_longer(cols = starts_with("E"),
+               names_to = "sample",
+               values_to = "prop_reads") %>% 
+  filter(prop_reads> 0.999) # identify samples that have ASVs that make up greater than 99% of reads.
+
+## Filter out samples with extreme low diversity:
+ASV.nested <- ASV.nested %>%
+  mutate(step.7_low_div_pass = purrr::map(Step.6.low.read.depth, ~ filter(., !sample %in% asv_prop$sample))
+  )
+### Summary.file
+ASV.summary <- 
+  ASV.nested %>%
+  dplyr::mutate(Miseq_region, Summary.1 = purrr::map(
+      step.7_low_div_pass,
+      ~ how.many(ASVtable = ., round = "7.Low.div.pass")), .keep="none") %>%
+  left_join(ASV.summary) %>%
+  mutate(Summary = map2(Summary, Summary.1, bind_rows)) %>%
+  dplyr::select(-Summary.1)
+
+ASV.summary$Summary[[1]]
+
+```
+
+## Step 8: Dissimilarity between PCR (biological) replicates [Sample Filtering]
+
+Important to keep in mind:
+- Make figures based on all of our replicate stages (biological, technical bottle, PCR)
+- Filter only the odd PCR replicates (if 3, throw out odd 1; if 2, throw out both)
+
+### Step 8.1 Generate dataframe to use for rep comparison
+
+```{r warning=FALSE, message=FALSE}
+# filter out metadata file for only columns needed for replicates:
+metadata_reps<-metadata_file %>% dplyr::select("samp_name","rep","rep_type","pcr_rep","sample_derived_from")
+
+## pull out remaining ASVs (hashes) & samples from previous step:
+step.7_low_div_pass_tibble<-ASV.nested %>%
+    dplyr::select(step.7_low_div_pass) %>% # pos contaminants removed tibble
+    unnest(step.7_low_div_pass) %>%
+    left_join(metadata_reps, by=join_by(sample==samp_name)) %>% # merge to keep replicate status from df
+  mutate(Miseq_region=rep(config_file$region))
+
+# Sum of how many samples and ASVs left:
+step.7_low_div_pass_tibble %>%
+  dplyr::summarise(n_distinct(sample), n_distinct(seq_id))
+
+```
+
+### Step 8.2 Compare Distances using ASVs
+
+```{r warning=FALSE, message=FALSE}
+#### eDNA Index Calculation 
+step.7_low_div_pass_tibble <- # transforms raw number of reads to eDNA index
+  step.7_low_div_pass_tibble %>%
+  dplyr::group_by(sample) %>%
+  mutate(Tot = sum(reads), Row.sums = reads / Tot) %>%
+  dplyr::group_by(seq_id) %>%
+  mutate(
+    Colmax = max(Row.sums),
+    Normalized.reads = Row.sums / Colmax # eDNA index calculation
+  )
+
+#### Calculate Vegan Distances
+all.distances.full.pre <- tibble_to_vegdist_all(step.7_low_div_pass_tibble)
+
+#### Turn this into a tibble df
+all.distances.melted.pre <- as.tibble(subset(melt(as.matrix(
+  all.distances.full.pre
+))))
+
+```
+
+#### Pre Occupancy distances:
+Create a three variables for all distances, they could be PCR replicates, BIOL replicates, or from the same site
+
+```{r warning=FALSE, message=FALSE}
+# Load distances from code above and add variables that indicate replicates
+all.distances.to.plot.pre <- all.distances.melted.pre %>%
+  separate(
+    Var1,
+    into = c("Miseq_region", "sample"), # separate out first variable from distance dataframe
+    sep = ":",
+    remove = F
+  ) %>%
+  left_join(metadata_reps, by = join_by("sample"=="samp_name")) %>% # join with metadata
+  dplyr::rename(., # rename values associated with sample names of Var1 distances
+    sample_derived_from1 = sample_derived_from,
+    rep1 = rep,
+    pcr_rep1 = pcr_rep,
+    rep_type1 = rep_type,
+    Miseq_region1 = Miseq_region
+  ) %>%
+  dplyr::select(Var1, Miseq_region1, sample_derived_from1, rep1, pcr_rep1, rep_type1, Var2, value) %>% # select values to compare with Var2 distances.
+  separate(
+    Var2,
+    into = c("Miseq_region", "sample"),
+    sep = ":",
+    remove = F
+  ) %>%
+  left_join(metadata_reps, by = join_by("sample"=="samp_name")) %>%  # select which columns to keep and compare
+  dplyr::rename(., # rename values associated with sample names of Var2 distances
+    sample_derived_from2 = sample_derived_from,
+    rep2 = rep,
+    pcr_rep2 = pcr_rep,
+    rep_type2 = rep_type,
+    Miseq_region2 = Miseq_region
+  ) %>%
+  # select only variables that will help id replicate status
+  dplyr::select(Var1, Var2, sample_derived_from1, rep1, pcr_rep1, rep_type1, Miseq_region1, 
+                sample_derived_from2, rep2, pcr_rep2, rep_type2, Miseq_region2, value) %>%
+  mutate(Distance.type = case_when( # add a column that indicates status of the replicates
+    !is.na(rep1) & !is.na(rep2) & 
+      sample_derived_from1 == sample_derived_from2 ~ "Bio.Tech.replicates",
+      !is.na(pcr_rep1) & !is.na(pcr_rep2) & 
+      sample_derived_from1 == sample_derived_from2 &  
+      rep1 == rep2  ~ "PCR.replicates",
+      Miseq_region1 == Miseq_region2 ~ "Same Barcode Different Site",
+      TRUE ~ "Different Barcode")
+  ) %>%
+  dplyr::select(Sample1 = Var1, Sample2 = Var2, value, Distance.type) %>% # rename for plotting
+  filter(Sample1 != Sample2) # keep only distances of samples that are different, makes plotting less computationally intensive
+  
+```
+
+Check all went well:
+
+```{r warning=FALSE, message=FALSE}
+## check output
+sapply(all.distances.to.plot.pre, function(x) {
+  summary(is.na(x))
+})
+
+### Save distance type factor level order
+all.distances.to.plot.pre$Distance.type <- all.distances.to.plot.pre$Distance.type %>% fct_relevel(
+  "PCR.replicates",
+  "Bio.Tech.replicates",
+  "Same Barcode Different Site",
+  "Different Barcode"
+)
+### Visualize Pairwise Dissimilarity
+plot_1 <- ggplot(
+  all.distances.to.plot.pre,
+  aes(fill = Distance.type, x = value, after_stat(density))
+) +
+  geom_histogram(
+    stat = "bin",
+    alpha = 0.9,
+    binwidth = 0.05
+  ) + # xlim(0, 1) +
+  facet_wrap(~Distance.type) +
+  labs(
+    x = "Pairwise Dissimilarity",
+    y = "Density",
+    fill = "Groups",
+    title = "eDNA Pairwise Dissimilarity Between Samples",
+    subtitle = "Pre Occupancy"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank()
+  )
+ggsave(
+  plot = plot_1,
+  here(config_file$parent_dir,
+      config_file$output_path,
+      "Output_plots",
+      "step8_eDNA_Pairwise_Dissimilarity_Between_Samples_pre_occupancy.png"),
+  device = "png",
+  width = 12,
+  height = 8,
+  units = "in"
+)
+
+```
+
+#### Visualize NMDS
+
+```{r warning=FALSE, message=FALSE}
+vare.mds <- metaMDS(all.distances.full.pre)
+data.scores <- as.data.frame(scores(vare.mds)) # Using the scores function from vegan to extract the site scores and convert to a data.frame
+data.scores$sample <- rownames(data.scores) # create a column of site names, from the rownames of data.scores
+# Add metadata
+data.scores <- 
+  data.scores %>%
+  separate(sample, into = c("Barcode", "sample"), sep = ":") %>%
+  left_join(metadata_reps, by = join_by("sample"=="samp_name"))
+
+# plot nmds
+plot_8_nmds_pre <- ggplot() +
+  geom_point(data = data.scores, 
+    aes(
+      x = NMDS1,
+      y = NMDS2,
+      color = as.factor(rep)),
+    size = 3
+  )  + # add the point markers
+  coord_equal() +
+  theme_bw()
+
+ggsave(
+  plot = plot_8_nmds_pre,
+  here(config_file$parent_dir,
+      config_file$output_path,
+      "Output_plots",
+       "step8_Ordination_of_Pairwise_Dissimilarity_Between_Samples_pre_occupancy.png"),
+  device = "png",
+  width = 12,
+  height = 8,
+  units = "in"
+)
+
+```
+
+#### Visualize NMDS - with only reps
+
+```{r warning=FALSE, message=FALSE}
+# filter out samples without biological replicates:
+reps_to_plot<-data.scores %>%
+  group_by(Barcode, sample_derived_from) %>%
+  dplyr::summarise(cases = n_distinct(rep, pcr_rep)) %>%
+  filter(., cases > 1)
+
+if (any(reps_to_plot$cases) > 1) {
+# plot nmds
+plot_8_nmds_pre_repsONLY <- ggplot() +
+  geom_point(data = data.scores %>% filter(sample_derived_from %in% reps_to_plot$sample_derived_from),
+             aes(
+      x = NMDS1,
+      y = NMDS2,
+      shape = as.factor(rep),
+      color = as.factor(rep),
+      label = sample_derived_from
+    ),
+    size = 3
+  )  + # add the point markers
+  # geom_text(data=data.scores %>% filter(sample_derived_from %in% reps_to_plot$sample_derived_from),
+  #          aes(label = sample_derived_from, x=NMDS1, y=NMDS2), hjust = -0.1, vjust = -0.5) +
+  geom_text_repel(data=data.scores %>% filter(sample_derived_from %in% reps_to_plot$sample_derived_from),
+            aes(label = sample_derived_from, x=NMDS1, y=NMDS2),
+    box.padding = unit(0.35, "lines"), # Adjust padding around labels
+    point.padding = unit(0.5, "lines"), # Adjust padding between label and point
+    segment.color = 'grey50', # Color of the line connecting label to point
+    max.overlaps = Inf ) + # add to keep all labels in figure
+  # geom_mark_hull(data=data.scores %>% filter(sample_derived_from %in% reps_to_plot$sample_derived_from),
+  #              aes(fill=sample_derived_from, x=NMDS1, y=NMDS2), alpha=0.3) +
+  coord_equal() +
+  theme_bw()
+
+ggsave(
+  plot = plot_8_nmds_pre_repsONLY,
+  here(config_file$parent_dir,
+      config_file$output_path,
+      "Output_plots",
+       "step8_Ordination_of_Pairwise_Dissimilarity_Between_Samples_pre_occupancy_repsOnly.png"),
+  device = "png",
+  width = 12,
+  height = 8,
+  units = "in"
+)
+} else {
+    message("No replicates biological or technical - skip plotting")
+  }
+
+
+```
+
+### Step 8.3: Calculate distance from centroid
+
+Instead of chosing based on the pairwise distances, we will use distance to centroid
+
+```{r warning=FALSE, message=FALSE}
+### Need to Remove Single Samples
+singles <- step.7_low_div_pass_tibble %>%
+  group_by(Miseq_region, sample_derived_from) %>%
+  dplyr::summarise(cases = n_distinct(rep, pcr_rep)) %>%
+  filter(., cases == 1) %>%
+  unite(
+    col = "barcode_sample",
+    Miseq_region,
+    sample_derived_from,
+    remove = FALSE,
+    sep = ":"
+  ) %>%
+  ungroup() %>%
+  dplyr::select(barcode_sample)
+# Currently this method does not filter out these single tech reps.
+
+# Nest Data
+nested.cleaning <- step.7_low_div_pass_tibble %>%
+  unite(
+    col = "barcode_sample",
+    Miseq_region,
+    sample_derived_from,
+    remove = FALSE,
+    sep = ":"
+  ) %>%
+  filter(., !barcode_sample %in% singles$barcode_sample) %>%
+  group_by(barcode_sample) %>%
+  nest()
+
+```
+
+Calculate Distances to Centroid
+
+```{r warning=FALSE, message=FALSE}
+if(file.exists(here(config_file$parent_dir,
+                    config_file$output_path,
+                    "Output_csv","step8.rep.dist_outliers.csv"))) {
+  message("distances to centroid already calculated -- load files")
+  all_distances.groups_outliers_id <-
+    read_csv(here(config_file$parent_dir,
+                    config_file$output_path,
+                    "Output_csv","step8.rep.dist_outliers.csv"))
+  outliers.step8 <-
+    read_csv(here(config_file$parent_dir,
+                    config_file$output_path,
+                    "Output_csv","step8.discarded_samples.csv"))
+}else{
+    if(nrow(nested.cleaning) > 0) {
+      message("distances to centroid not calculated yet -- running code")
+      # use decontmaination utilities to run on samples and add to nested files
+      # Note: this function calculates distance across the sample_derived_from column to compare all reps
+      nested.cleaning <-  nested.cleaning %>%
+        mutate(matrix = purrr::map(data, tibble_to_vegdist_bio_rep_single))
+      
+      # Add a dataframe of the number of comparisons (or total number of reps) per sample_derived_from
+      nested.cleaning <- nested.cleaning %>% 
+        mutate(ncomparisons = purrr::map(matrix, length))
+      
+      # Add distance from each sample derived from to centriod, which is calculated in decontamination utilities
+      nested.cleaning <- nested.cleaning %>% 
+        mutate(distances = map2(matrix, barcode_sample, dist_to_centroid))
+      
+      # unnest distances to centriods between bio reps:
+      all_distances.groups <- nested.cleaning %>%
+        separate(barcode_sample, c("Miseq_region", "sample_derived_from"), sep = ":") %>%
+        unnest_longer(distances) %>%
+        dplyr::select(Miseq_region, sample_derived_from, distances_id, distances)
+      
+      # Take a look at the smallest and largest distances
+      all_distances.groups$distances %>% sort()
+      
+      ### Calculate normal distribution of distances to centroid
+      normparams.step8 <- MASS::fitdistr(all_distances.groups$distances, "normal")$estimate
+      
+      ### Calculate Probability
+      probs.step8 <- pnorm(
+        all_distances.groups$distances,
+        normparams.step8[1],
+        normparams.step8[2]
+      )
+      
+      ## Determine Outliers
+      probs.step8_tb <- enframe(probs.step8) %>%
+        dplyr::rename(distances_id = name, prob = value)
+      
+      # use step 7 dataframe to add rep_type to outlier df's:
+      rep_id_for_dist <- step.7_low_div_pass_tibble %>% ungroup() %>% 
+        unite(col = "barcode_sample",Miseq_region,sample_derived_from,rep,remove = FALSE,sep = ":", na.rm = TRUE)  %>%
+        dplyr::select("barcode_sample","rep_type","pcr_rep") %>% unique()
+      
+      # identify outliers to save as csv:
+      all_distances.groups_outliers_id<- all_distances.groups %>% 
+        left_join(probs.step8_tb) %>%
+        mutate(rep_outlier_flag=case_when(distances > config_file$step8_max_dist_cutoff |
+          prob > config_file$step8_max_probability_cutoff ~ "Outlier",
+          distances <= config_file$step8_max_dist_cutoff |
+          prob <= config_file$step8_max_probability_cutoff ~ "Ok",
+          TRUE ~ NA)) %>%
+        left_join(rep_id_for_dist, by=join_by(distances_id==barcode_sample))
+      
+      # merge centroid distances with probability
+      outliers.step8 <- all_distances.groups %>% 
+        left_join(probs.step8_tb) %>%
+        filter(distances > config_file$step8_max_dist_cutoff |
+          prob > config_file$step8_max_probability_cutoff) %>%
+        left_join(rep_id_for_dist, by=join_by(distances_id==barcode_sample))
+      
+      
+      ## Save all reps to dataframe:
+      write_csv(all_distances.groups_outliers_id, here(
+        config_file$parent_dir,
+        config_file$output_path,
+        "Output_csv","step8.rep.dist_outliers.csv"))
+      ## Save Outliers to dataframe:
+      write_csv(outliers.step8, here(
+        config_file$parent_dir,
+        config_file$output_path,
+        "Output_csv","step8.discarded_samples.csv"))
+    }else{
+      message("No replicates biological or technical - skip distance to centroid calculation")
+    }
+}
+```
+
+Plot remaining replicates:
+
+```{r warning=FALSE, message=FALSE}
+if(nrow(nested.cleaning) > 0) {
+## Plot Final Sample Replication Levels
+step.8_replicate_dissim_for_plotting <- step.7_low_div_pass_tibble %>%
+  unite(
+    col = "distances_id",
+    Miseq_region,
+    sample_derived_from,
+    rep,
+    remove = FALSE,
+    sep = ":",
+    na.rm = TRUE
+  )
+
+# plot replicates and samples
+plot_2_tile<- step.8_replicate_dissim_for_plotting %>%
+  filter(., !distances_id %in% outliers.step8$distances_id) %>%
+  ungroup() %>%
+  dplyr::group_by(Miseq_region,sample_derived_from,rep) %>%
+  dplyr::summarise(cases = n_distinct(distances_id)) %>%
+  ggplot() +
+  geom_raster(aes(x = sample_derived_from, y = rep, fill = cases)) +
+  geom_text(aes(x = sample_derived_from, y = rep, label = cases), color = "white") +
+  ggtitle("Sample Replication Level") +
+  facet_wrap(~Miseq_region) +
+  theme(axis.text.x = element_text(angle = 90))
+
+# save plot
+ggsave(
+  plot = plot_2_tile,
+  here(config_file$parent_dir,
+       config_file$output_path,
+       "Output_plots",
+       "step8_Final_sample_replication_level.png"),
+  device = "png",
+  width = 20,
+  height = 8,
+  units = "in"
+)
+  }else{
+   message("No replicates biological or technical - skip distance to centroid calculation")
+}
+```
+
+### Step 8.4: Create nested and summary files:
+
+#### Add to nested file
+
+One version includes flags for outliers (Step.8.tibble_dissimilarity), while the other removes the outlier replicates (Step.8.rep_outliers_removed)
+
+```{r warning=FALSE, message=FALSE}
+# run code only if replicates exist:
+if(nrow(nested.cleaning) > 0) {
+  
+## Add astep 8 dataframe with outliers removed to ASV.nested
+ASV.nested <- ASV.nested %>%
+  mutate(Step.8.rep_outliers_removed = purrr::map(step.7_low_div_pass, function(.x) {
+    .x %>% 
+      left_join(metadata_file %>%
+                  dplyr::select("samp_name","rep","rep_type","pcr_rep","sample_derived_from")
+                , by = join_by("sample"=="samp_name")) %>%
+      unite(
+        col = "distances_id",
+        sample_derived_from,
+        rep,
+        remove = FALSE,
+        sep = ":"
+      ) %>% 
+      left_join(all_distances.groups_outliers_id %>% dplyr::select("distances_id","rep_outlier_flag")) %>% # add rep_outlier_flag
+      mutate(rep_outlier_flag = case_when(is.na(rep_outlier_flag) ~ "Not Replicate",
+            !is.na(rep_outlier_flag) ~ rep_outlier_flag)) %>%
+      filter(., rep_outlier_flag =="Ok" | rep_outlier_flag =="Not Replicate")
+  }))
+  }else{
+    message("No replicates biological or technical - add dummy columns for summary calc")
+   ASV.nested <- ASV.nested %>%
+  mutate(Step.8.rep_outliers_removed = purrr::map(step.7_low_div_pass, function(.x) {
+    .x %>% 
+      left_join(metadata_file %>%
+                  dplyr::select("samp_name","rep","rep_type","pcr_rep","sample_derived_from")
+                , by = join_by("sample"=="samp_name")) %>%
+      unite(
+        col = "distances_id",
+        sample_derived_from,
+        rep,
+        remove = FALSE,
+        sep = ":"
+      ) %>%
+      mutate(distances_id=NA,
+             rep_outlier_flag="Not Replicate")
+  }))
+  
+  }
+```
+
+#### Add to summary file
+
+```{r warning=FALSE, message=FALSE}
+## Add to ASV.summary
+ASV.summary <- ASV.nested %>%
+  dplyr::mutate(Miseq_region,
+    Summary.1 = purrr::map(
+      Step.8.rep_outliers_removed,
+      ~ how.many(ASVtable = ., round = "8.Rep.outliers_removed")), .keep="none"
+  ) %>%
+  left_join(ASV.summary) %>%
+  mutate(Summary = map2(Summary, Summary.1, bind_rows)) %>%
+  dplyr::select(-Summary.1)
+
+# view table of remaining reads and samples:
+ASV.summary$Summary[[1]]
+
+```
+
+## Save rds files to bring into partIV
+
+```{r warning=FALSE, message=FALSE}
+# Save summary and nested data
+saveRDS(ASV.nested, file = here(
+        config_file$parent_dir,
+        config_file$output_path,
+        "Output_R","ASV.nested_final_partIII.RDS"))
+saveRDS(ASV.summary, file = here(
+        config_file$parent_dir,
+        config_file$output_path,"Output_R","ASV.summary_final_partIII.RDS"))
+
+```
+
+## Final formatting of files before moving to Part III
+
+```{r warning=FALSE, message=FALSE}
+# run code only if replicates exist:
+if(nrow(nested.cleaning) > 0) {
+  
+# save final files as csv files
+partIII_final_output <- ASV.nested %>%
+  dplyr::select(step.7_low_div_pass) %>% 
+  unnest(step.7_low_div_pass) %>% 
+  left_join(metadata_file %>%
+                  dplyr::select("samp_name","rep","rep_type","pcr_rep","sample_derived_from")
+                , by = join_by("sample"=="samp_name")) %>%
+      unite(
+        col = "distances_id",
+        sample_derived_from,
+        rep,
+        remove = FALSE,
+        sep = ":"
+      ) %>% 
+      left_join(all_distances.groups_outliers_id %>% 
+                  dplyr::select("distances_id","rep_outlier_flag")) %>% # add rep_outlier_flag
+      mutate(rep_outlier_flag = case_when(is.na(rep_outlier_flag) ~ "Not Replicate",
+            !is.na(rep_outlier_flag) ~ rep_outlier_flag)) 
+ }else{
+    message("No replicates biological or technical - add dummy columns for summary calc")
+   # save final files as csv files
+    partIII_final_output <- ASV.nested %>%
+      dplyr::select(step.7_low_div_pass) %>% 
+      unnest(step.7_low_div_pass) %>% 
+      left_join(metadata_file %>%
+                      dplyr::select("samp_name","rep","rep_type","pcr_rep","sample_derived_from")
+                    , by = join_by("sample"=="samp_name")) %>%
+          unite(
+            col = "distances_id",
+            sample_derived_from,
+            rep,
+            remove = FALSE,
+            sep = ":"
+          ) %>% 
+      mutate(distances_id=NA, 
+             rep_outlier_flag="Not Replicate")
+ }
+
+# ASVs and fasta combined
+partIII_ASV_final_output <- partIII_final_output %>%
+  dplyr::select("seq_id","sequence","sample","reads") %>%
+  pivot_wider( # pivot wider so read counts are now below each sample name
+      names_from = sample,
+      values_from = reads,
+      values_fill = list(reads = 0)
+    )
+
+# metadata file:
+partIII_meta_final_output <- partIII_final_output %>% dplyr::select(c("sample","Sequencing_depth_flag":"rep_outlier_flag")) %>%
+  relocate(., ends_with("flag"), .after = last_col())
+
+# save metadata and asv file:
+write_csv(partIII_ASV_final_output, file = here(
+        config_file$parent_dir,
+        config_file$output_path,
+        "Output_csv","asv_final_partIII.csv"))
+write_csv(partIII_meta_final_output, file = here(
+        config_file$parent_dir,
+        config_file$output_path,
+        "Output_csv","meta_final_partIII.csv"))
+
+```
+
+#### Software and package versions used for file:
+
+```{r warning=FALSE}
+print(sessionInfo(), locale = FALSE)
+```

@@ -1,0 +1,77 @@
+---
+title: "OME Run4 Decontam and QAQC merge and post-merge"
+author: "Sam Setta"
+date: "`Sys.Date()`"
+
+# Part II
+# metabarcoding region:
+region: "18Sv4"
+
+# Input path for parent directory where all runs are stored:
+parent_dir: "/Users/setta/Documents/SKQ_AlaskaCruises/SKQ_Alaska_Analysis"
+
+# Runs to merge for project files separated by comma: (needs to be the directory name, e.g. "OME_Run1,OME_Run2")
+runs_for_project: "SKQ_Alaska_data"
+
+# Fasta file to merge with output
+fasta_file: "raw/Run4_18Sv4_ASVs.fa"
+
+# Project to filter output by:
+project_of_interest: "SKQ_Alaska_data/processed/dy2206_faire.csv"
+project_name: "DY2206"
+
+# Path to the merged output.
+output_path: "SKQ_Alaska_data/processed/decontam_QAQC/18Sv4/DY2206"
+
+# Part III
+# Path to the metadata file (can use sample metadata file from Brynn). Please see detailed instructions on formatting and required columns
+input_meta_file_partIII: "meta_final_partII.csv"
+project_dir: NULL
+
+# Step 6: Extreme low sample depth pass
+# Threshold on the beta distribution used to eliminate samples with low sequencing depth. Default is 0.05. Set to 0.00000001 to ignore.
+step6_low_dist_probability_cutoff: 0.05
+# Extreme low sample depth pass, threshold used to eliminate samples with low sequencing depth. Default is 10000. Set to 0 to ignore.
+step6_minimum_read_cutoff: 1000
+
+# Step 8: Maximum distance and probability cutoffs for dissimilarity filtering.
+# Threshold of degree of dissimilarity between technical replicates. Default is 0.5. Set to 0.00000001 to ignore.
+step8_max_dist_cutoff: 0.5
+# Threshold on the normal distribution used to eliminate samples that are highly dissimilar from technical replicates. Default is 0.975. Set to 1 to ignore.
+step8_max_probability_cutoff: 1
+
+# Part IV
+# Path to the metadata file (can use sample metadata file from Brynn). Please see detailed instructions on formatting and required columns.
+input_meta_file_partIV: "meta_final_partIII.csv"
+
+# Step 9: Removing singletons (default is 1)
+step9_TotalReadsperASV_cutoff: 1
+
+# Step 10: Presence of Occurence Threshold (each ASV needs to be found in at least this number of samples)
+step10_occurrence_thresh: 2
+
+# Step 11: n-ton ASV threshold or ASV % of total reads 
+# choose to filter either by n-ton or ASV % of total reads: ("n-ton" or "perc_reads")
+step11_filt_option: "n-ton"
+# if filtering by n-ton (minimum # of reads per ASV), default 1 won't filter any out. 
+# Note: this will affect diversity numbers downstream!
+step11_nton_thresh: 1
+# if filtering by percent of total reads (minimum % of reads per ASV), default 0 won't filter any out. 
+step11_perc_reads: 0 
+
+# Step 12: Optional, filter out low diversity samples (1 default will skip this filtering)
+# otherwise, if filtering out samples that are comprised greater than x% use the proportion, e.g. 95% of one ASV use the value 0.95
+step12_prop: 1
+
+# Step 13: Optional, remove unknown ASVs.
+# If FALSE will skip this filtering step
+step13_remove: FALSE
+# Set Unknown characters to use:
+# Step 4: Path to a file listing species to remove as known lab contaminants.
+# Set to null if using hard-coded list within the script. Otherwise provide a CSV file with a column titled "Domain" that includes all relevant unknown variations.
+step13_unknown_characters_to_remove_path: "SKQ_Alaska_data/processed/decontam_QAQC/Unknown_characters.csv"
+
+# Step 14: Low sample depth pass/discard PCR replicates of low depth (here the default is 10,000 reads/sample) [Sample Filtering]
+step14_depth_filt: 10000
+# Threshold on the beta distribution used to eliminate samples with low sequencing depth. Default is 0.05. Set to 0.00000001 to ignore.
+step14_low_dist_probability_cutoff: 0.05

@@ -1,0 +1,972 @@
+---
+title: "DY2022_Thalassiosira_Run4"
+author: "Sam Setta"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## Goal of Script
+
+Check what Thalassiosira species were found during Dyson 2022 cruise for comparison to IFCB results from Gulce Kurtay:
+
+- Looking for differences M2 and M4 in Thalassiosira species comp
+- IFCB only sampled from the surface (flow-through), so only looking at samples in the top 5m.
+
+# Conclusion from the analyses below:
+
+1) Little variation in Thalassiosira sp. occurrence accross DY2206 sites, one ASV does not show up in colder temp and one asv does not show up in warmer temp. Vary narrow temperature range for samples, occurrence might differ if many more temperatures were analyzed.
+
+2) We do see changes in species occurrence when looking at all phytoplankton groups, so there is some change with temperature or sampling site.
+
+```{r setup, warning=FALSE, message=FALSE}
+# install libraries
+# BiocManager::install(c("tidyverse", "lubridate", "RColorBrewer", "ggsci", "dplyr", "phyloseq", "knitr", "readxl","ggplot2","NatParksPalettes","purrr", "ggvenn", "zetadiv"))
+# BiocManager::install("iNEXT")
+# BiocManager::install(c("phyloseq", "microbiome", "ComplexHeatmap"), update = FALSE)
+library("tidyverse")
+library("vegan")
+library("phyloseq")
+library("ape")
+library("RColorBrewer")
+library("ggsci")
+library("knitr")
+library("readxl")
+library("here")
+library("ggplot2")
+library("NatParksPalettes")
+library("glue")
+library("Biostrings")
+library("openssl")
+library("cmocean")
+
+# mapping libraries
+library("rnaturalearth")
+library("rnaturalearthdata")
+library("mapview")
+library("sf")
+library("leaflet")
+# BiocManager::install("maps")
+library("maps")
+# BiocManager::install(c("mapdata","measurements","raster","rasterVis", "rgdal","lattice"))
+library("mapdata")
+library("measurements")
+library("raster")
+library("rasterVis")
+# install.packages("marmap")
+library("marmap")
+library("microbiome")
+
+# load map data:
+world <- ne_countries(scale = "medium", returnclass = "sf")
+state_prov <- rnaturalearth::ne_states(c("united states of america", "canada"))
+
+# install microViz
+# install.packages(
+#  "microViz",
+#  repos = c(davidbarnett = "https://david-barnett.r-universe.dev", getOption("repos"))
+# )
+library("microViz")
+
+# where data should be saved
+here()
+
+# data directory:
+data_dir <- "/Users/setta/Documents/SKQ_AlaskaCruises"
+
+```
+
+Read in data
+
+```{r warning=FALSE, message=FALSE}
+# load decontmainated 18S v4 asv table:
+DY22_18Sv4_all_counts<-read_delim(here(data_dir,
+                                  "SKQ_Alaska_Analysis",
+                                  "SKQ_Alaska_data",
+                                  "processed","decontam_QAQC","18Sv4","DY2206",
+                                  "Output_csv",
+                                  "Decontam_final_asv_table.csv"), col_names = TRUE)
+
+# load 18S v4 taxonomy table - all taxa
+DY22_18Sv4_all_tax<-read_delim(here(data_dir,
+                                  "SKQ_Alaska_Analysis",
+                                  "SKQ_Alaska_data",
+                                  "processed","decontam_QAQC","18Sv4","DY2206",
+                                  "Output_csv",
+                                  "Decontam_final_taxonomy_table.csv"))
+
+# load 18S v4 metadata table
+DY2206_meta<-read_delim(here(data_dir,
+                                  "SKQ_Alaska_Analysis",
+                                  "SKQ_Alaska_data",
+                                  "processed",
+                                  "dy2206_faire.csv")) %>%
+   mutate(samp_name=gsub("\\-", ".", samp_name))
+
+# merge all taxa:
+DY22_18Sv4_all_counts_tax<-DY22_18Sv4_all_tax %>%
+  unique() %>%
+  left_join(DY22_18Sv4_all_counts, by="seq_id") 
+
+# %>% filter(grepl("Thalassiosira", sum.taxonomy, ignore.case = TRUE))
+
+# add a table of asvs for each hash md5 (seqID)
+asv_seq_id<-readDNAStringSet(here(data_dir,
+                                  "SKQ_Alaska_Analysis",
+                                  "SKQ_Alaska_data",
+                                  "raw",
+                                  "Run4_18Sv4_ASVs.fa"), format="fasta") %>%
+  as.data.frame() %>%
+  as_tibble(rownames = "ASV") %>%
+  dplyr::rename("Sequence" = `x`) %>%
+  mutate(seq_id = as.character(md5(Sequence)))
+
+```
+
+
+Load metadata
+
+```{r warning=FALSE, message=FALSE}
+# sample names from merged data:
+col_names_to_keep <- DY22_18Sv4_all_counts_tax %>%
+  dplyr::select(-c("seq_id","sum.taxonomy")) %>%
+  names()
+
+# keep only samples from final decontam output:
+DY2206_meta_filt<-DY2206_meta %>%
+  filter(samp_name %in% col_names_to_keep)
+
+# go from wide to long:
+DY22_18Sv4_all_counts_tax_v2<- DY22_18Sv4_all_counts_tax %>%
+  pivot_longer(!c(seq_id, sum.taxonomy), names_to = "Sample", values_to = "count")
+
+```
+
+## Prepping data for analyses:
+
+Create phyloseq object of Thalassiosira data:
+
+```{r warning=FALSE, message=FALSE}
+# phyloseq object of all counts
+all_counts_ps <- DY22_18Sv4_all_counts_tax %>%
+  dplyr::select(-c(sum.taxonomy)) %>%
+  column_to_rownames("seq_id") %>%
+  as.matrix() %>%
+  otu_table(taxa_are_rows = TRUE)
+
+# phyloseq object of all taxa:
+all_taxon_ps <- DY22_18Sv4_all_counts_tax %>%
+  # rename_with(~ str_remove(., "MP_"), starts_with("MP_")) %>%
+  dplyr::select(c(seq_id, sum.taxonomy)) %>%
+   separate(col = "sum.taxonomy", into = c("Domain", "Supergroup", "Division", "Subdivision", "Class", "Order", "Family", "Genus","Species","Extra"), sep = ";") %>%
+  dplyr::select(-c("Extra")) %>%
+  mutate(Species = if_else(str_ends(Species, "_sp."), NA, Species)) %>%
+  column_to_rownames("seq_id") %>%
+  as.matrix() %>%
+  tax_table()
+
+# format metadata for phyloseq:
+all_sam_ps<-DY2206_meta_filt %>%
+  dplyr::select(c("samp_name","materialSampleID","decimalLatitude","decimalLongitude","temp","minimumDepthInMeters","maximumDepthInMeters")) %>%
+  mutate(across("decimalLatitude":"maximumDepthInMeters", as.numeric)) %>%
+  column_to_rownames("samp_name") %>%
+  sample_data()
+
+# create phyloseq:
+all_ps<-phyloseq(all_sam_ps, all_counts_ps, all_taxon_ps) %>% tax_fix() %>%
+  ps_mutate(depth_max=round(maximumDepthInMeters,digits=0), depth_min=round(minimumDepthInMeters, digits=0))
+
+```
+## Format ddata for microviz
+
+Only Thalassiosira
+
+```{r}
+# subset dataframe
+Th_ps<-subset_taxa(all_ps, Genus=="Thalassiosira")
+all_ps_surf<-all_ps %>% subset_samples(depth_max<5)
+Th_ps_surf<-Th_ps %>% subset_samples(depth_max<5)
+
+# ord_explore(all_ps_surf)
+sample_data(all_ps_surf)
+summarize_phyloseq(Th_ps_surf)
+sample_sums(all_ps_surf)
+```
+
+Bargraph of All Phytos across three depths:
+
+```{r fig1, fig.align = "center"}
+# Check out bargraph
+all_ps %>%
+  ps_mutate(depth_gp = case_when(depth_max<5 ~ "Surface",
+                                 depth_max>5 & depth_max<40 ~ "Mid-Depth",
+                                 depth_max>40 ~ "Deep"),
+            temp_int = round(temp),
+            temp_gp = case_when(temp_int==0 ~ "0°C",
+                                temp_int==1 ~ "1°C",
+                                temp_int==2 ~ "2°C",
+                                temp_int==3 ~ "3°C")) %>%
+  ps_filter(depth_gp=="Surface") %>%
+  # ps_arrange(desc(temp_int)) %>%
+  comp_barplot(
+    tax_level = "Species",
+    n_taxa = 15,
+    sample_order = "default",
+    bar_width = 0.9,
+    bar_outline_colour = "black",
+    #palette=distinct_palette(pal = "kelly", add = "lightgrey"),
+    order_with_all_taxa = TRUE#,
+    # label = "temp_int"
+  ) + 
+  # labs(x=expression(Temperature*degree*C)) +
+  labs(x="SampleID") +
+  facet_grid(depth_gp~ temp_gp, scales="free", space="free") + 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45,hjust=1))
+
+# save plot:
+ggsave(
+    here("figures","DY2206_All_bargraph_surface.png"),
+    device = "png",
+    width = 12,
+    height = 10,
+    units = "in"
+  )
+
+```
+
+Bargraph of Thalassiosira across three depths:
+
+```{r fig2, fig.align = "center"}
+# Check out bargraph
+Th_ps %>%
+  ps_mutate(depth_gp = case_when(depth_max<5 ~ "Surface",
+                                 depth_max>5 & depth_max<40 ~ "Mid-Depth",
+                                 depth_max>40 ~ "Deep"),
+            temp_int = round(temp),
+            temp_gp = case_when(temp_int==0 ~ "0°C",
+                                temp_int==1 ~ "1°C",
+                                temp_int==2 ~ "2°C",
+                                temp_int==3 ~ "3°C")) %>%
+  # ps_filter(depth_gp=="Surface") %>%
+  ps_arrange(dplyr::desc(temp_int)) %>%
+  comp_barplot(
+    tax_level = "Species",
+    sample_order = "default",
+    bar_width = 0.9,
+    bar_outline_colour = "black",
+    order_with_all_taxa = TRUE#,
+    # label = "temp_int"
+  ) + 
+  # labs(x=expression(Temperature*degree*C)) +
+  labs(x="SampleID") +
+  facet_grid(depth_gp~ temp_gp, scales="free", space="free") + 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45,hjust=1))
+
+# save plot:
+ggsave(
+    here("figures","DY2206_Th_bargraph.png"),
+    device = "png",
+    width = 12,
+    height = 10,
+    units = "in"
+  )
+
+```
+
+## Ordination plot with MicroViz
+
+NMDS plot of all protists
+
+```{r fig3, fig.align = "center"}
+# filter non-phyto taxa:
+all_ps_filt<-subset_taxa(all_ps_surf, Domain=="Eukaryota" & Family!="Strombidiidae" & Genus!="Pseudocalanus" & Subdivision!="Metazoa" & Subdivision!="Fungi" & Subdivision!="Eukaryota Domain" & Subdivision!="Rotosphaerida" & Subdivision!="Apusomonada" & Subdivision!="Discosea" & Subdivision!="Tubulinea" & Subdivision!="Fornicata" & Subdivision!="Amoebozoa_XX")
+#ordination with microviz:
+# ord_explore(all_ps_filt)
+
+# Ordination plot of all taxa:
+all_ps_surf_nmds_calc<- all_ps_filt %>%
+ tax_transform(rank = "unique", trans = "binary") %>%
+ dist_calc(dist = "bray") %>%
+ ord_calc(
+  method = "NMDS"
+ )
+
+# get the distance matrix:
+all_ps_surf_nmds_dist<-dist_get(all_ps_surf_nmds_calc)
+
+# plot ordination
+all_ps_surf_nmds<- all_ps_surf_nmds_calc %>%
+  ord_plot(
+  axes = c(1, 2),
+  colour = "temp", fill = "temp",
+  shape = 21, alpha = 1,
+  size = 5
+ ) +
+  theme_bw()
+  #guides(color = "none") +
+  # guides(fill=guide_legend(title=expression(Temperature*degree*C)),
+  #       color=guide_legend(title=expression(Temperature*degree*C)))
+
+all_ps_surf_nmds
+
+# save plot:
+ggsave(
+    plot = all_ps_surf_nmds,
+    here("figures","DY2206_All_phytos_NMDS_microviz.png"),
+    device = "png",
+    width = 10,
+    height = 8,
+    units = "in"
+  )
+
+```
+
+## Improved ordination with ggplot:
+
+```{r fig4, fig.align = "center"}
+# save otu table:
+all_ps_filt_otu<-t(otu_table(all_ps_filt)) %>% data.frame()
+
+# save environmental data:
+dy2206_surf_phyto_env<-sample_data(all_ps_filt) %>% 
+  data.frame() %>%
+  rownames_to_column(var="Sample") %>%
+  dplyr::select("Sample","temp")
+
+# calc PCoA:
+dy2206_surf_phyto_dist <- vegdist(all_ps_filt_otu,method="jaccard")
+dy2206_surf_phyto_pcoa <- cmdscale(dy2206_surf_phyto_dist, eig = TRUE, k=2, add=TRUE) # add makes all eigen positive
+# checking out pcoa plot:
+# ordiplot(dy2206_surf_phyto_pcoa, display = 'sites', type = 'text')
+# barplot(dy2206_surf_phyto_pcoa$eig, names = paste ('PCoA', 1:5), las = 3, ylab = 'eigenvalues')
+
+
+# calc nmds
+# dy2206_surf_phyto_metaMDS<-metaMDS(all_ps_filt_otu, distance='jaccard', trymax=100)
+
+# save 'site' scores to plot
+site.scrs <- as.data.frame(scores(dy2206_surf_phyto_pcoa, display = "sites")) %>%
+  dplyr::rename("pcoa1"=Dim1,"pcoa2"=Dim2)
+# calculate percent explained:
+perc_explained<-round(100*(dy2206_surf_phyto_pcoa$eig/sum(dy2206_surf_phyto_pcoa$eig)), digits=1)
+labs=c(glue("PCo 1 ({perc_explained[1]}%)"),
+       glue("PCo 2 ({perc_explained[2]}%)"))
+
+# join with environmental for plotting:
+site.scrs_v2 <-site.scrs %>%
+  rownames_to_column(var="Sample") %>%
+  left_join(dy2206_surf_phyto_env)
+
+# Ordination plot of all taxa:
+all_phytos_pcoa<-ggplot(site.scrs_v2, aes(x=pcoa1, y=pcoa2))+ #sets up the plot
+  geom_point(aes(pcoa1, pcoa2, fill = temp), 
+                 shape = 21, color="black", size = 5) +
+  theme_bw() +
+  labs(fill=expression(Temp*degree*C),x=labs[1],y=labs[2]) +
+  scale_fill_cmocean(name="thermal") +
+  # scale_fill_gradient(low = "blue", high = "white",guide=guide_colorbar(frame.colour = "black", ticks.colour = "black")) +
+  theme(plot.title = element_text(hjust=0.5, size=14),
+        text=element_text(size=20))
+
+# view plot
+all_phytos_pcoa
+
+# save plot:
+ggsave(
+    plot = all_phytos_pcoa,
+    here("figures","DY2206_All_phytos_pcoa.png"),
+    device = "png",
+    width = 8,
+    height = 6,
+    units = "in"
+  )
+
+```
+
+## Composition with ordination from microviz:
+
+```{r fig5, fig.align = "center"}
+# Ordination plot of all taxa:
+all_ps_surf_nmds_iris<- all_ps_filt %>%
+ tax_transform(rank = "unique", trans = "binary") %>%
+ dist_calc(dist = "bray") %>%
+ ord_calc(
+  method = "NMDS"
+ ) %>%
+  ord_plot_iris(tax_level = "Genus", ord_plot = "above", anno_colour = "temp",
+                sizze=5)
+
+# view plot
+all_ps_surf_nmds_iris
+
+# save plot:
+ggsave(
+    plot = all_ps_surf_nmds_iris,
+    here("figures","DY2206_All_phytos_NMDS_wIRIS_microviz.png"),
+    device = "png",
+    width = 10,
+    height = 10,
+    units = "in"
+  )
+
+```
+
+## Example of constrained ordination from microviz
+
+Note not the best stats, will follow GUSTAME tutorial later in script:
+
+```{r fig6, fig.align = "center"}
+# Ordination plot of all taxa:
+all_ps_surf_const_calc <- all_ps_filt %>%
+  tax_transform(rank = "unique", trans = "binary") %>%
+ dist_calc(dist = "bray") %>%
+ ord_calc(
+  constraints = c("temp"),
+  method = "auto"
+ )
+# plot ordination
+all_ps_surf_const<- all_ps_surf_const_calc %>%
+  ord_plot(
+  axes = c(1, 2),
+  colour = "temp", fill = "temp",
+  shape = "circle", alpha = 1,
+  size = 5
+ ) +
+  theme_bw() 
+  #guides(color = "none") +
+  # guides(fill=guide_legend(title=expression(Temperature*degree*C)),
+  #       color=guide_legend(title=expression(Temperature*degree*C)))
+
+# view plot
+all_ps_surf_const
+
+# save plot:
+ggsave(
+    plot = all_ps_surf_const,
+    here("figures","DY2206_All_phytos_CCA_microviz.png"),
+    device = "png",
+    width = 10,
+    height = 8,
+    units = "in"
+  )
+
+```
+
+
+## Map of Sampling
+
+```{r fig7, fig.align = "center", warning=FALSE, results='hide', echo=FALSE}
+# format metadata:
+DY2206_meta_filt_mapping<-DY2206_meta_filt %>%
+  dplyr::select(c("samp_name","materialSampleID","decimalLatitude","decimalLongitude","temp","minimumDepthInMeters","maximumDepthInMeters")) %>%
+  mutate(across("decimalLatitude":"maximumDepthInMeters", as.numeric)) %>%
+  column_to_rownames("samp_name") %>% 
+  mutate(depth_max=round(maximumDepthInMeters,digits=0), 
+         depth_min=round(minimumDepthInMeters, digits=0)) %>%
+  filter(depth_max<5) %>%
+  rownames_to_column(var="Sample")
+  
+# create sf object
+dy2206_sf <- st_as_sf(DY2206_meta_filt_mapping, coords = c("decimalLongitude", "decimalLatitude"),  crs = 4326)
+# mapview(sbux_sf)
+mapview_mapOfDY2206<-mapview(dy2206_sf, cex=10, label = dy2206_sf$sites, # Specify the column containing your labels
+            labelOptions = labelOptions(
+              noHide = FALSE,      # Keep labels visible even when not hovering
+              direction = "auto", # Label direction (e.g., "right", "left", "auto")
+              offset = c(5, -5),  # Offset labels from points (x, y)
+              textsize = "8px",  # Font size of labels
+              #textOnly = TRUE
+            ))
+mapview_mapOfDY2206
+
+# save mapview image:
+# mapshot(mapview_mapOfDY2206, file = paste0(here("figures"), "DY2206_SurfSamples_mapview.png"))
+```
+
+
+Create blank map of Alaska:
+
+```{r fig8, fig.align = "center", warning=FALSE, results='hide', echo=FALSE}
+# load map data
+world <- ne_countries(scale = "medium", returnclass = "sf")
+state_prov <- rnaturalearth::ne_states(c("united states of america", "canada","russia")) %>% st_transform(3338)
+
+# long/lat without projection:
+crsLONGLAT <- "+proj=longlat +datum=WGS84 +no_defs"
+
+# the bouding box polygon in long/lat projection, i.e. axis-aligned
+bb <- st_sfc(
+  st_polygon(list(cbind(
+    c(-175,-145,-145,-175,-175), # x-coordinates (longitudes) of points A,B,C,D
+    c(50,50,75,50,50)     # y-coordinates (latitudes) of points A,B,C,D
+    ))),
+  crs = crsLONGLAT)
+
+# now in in LAEA projection
+map_limits <- st_transform(bb, crs = 3338)
+map_limits_box <- st_bbox(map_limits)
+
+## Alaska map
+Alaska_map<-ggplot(data = state_prov) +
+            geom_sf(border=1) +
+  coord_sf(crs = 3338, 
+           xlim = c(map_limits_box["xmin"], map_limits_box["xmax"]), 
+           ylim = c(map_limits_box["ymin"], map_limits_box["ymax"]),
+           expand=FALSE) +
+  scale_x_continuous(breaks=seq(round(map_limits_box["xmin"]), round(map_limits_box["xmax"]), by=10)) +
+  ggspatial::annotation_north_arrow(location = "tr", which_north = "true") +
+   theme_bw() +
+   theme(test=element_text(size=20))
+
+Alaska_map
+
+# save map
+ggsave(
+  file = here::here("figures", "Alaska_blank_map.pdf"),
+  width = 10,
+  height = 10, limitsize = FALSE
+)
+
+```
+
+convert environmental data lat/lon for map projection distortion:
+
+```{r echo=FALSE}
+# function to convert lat and lon to correct for map projection:
+convert_ant = function(data,
+                    src.proj = CRS("+init=epsg:4326"),
+                    ant.proj = CRS("+init=epsg:3338")) {
+        require(sp)
+        as.data.frame(
+                spTransform(
+                        SpatialPointsDataFrame(
+                                coords = data.frame(Lon_crs = DY2206_meta_filt_mapping$decimalLongitude,
+                                                    Lat_crs = DY2206_meta_filt_mapping$decimalLatitude),
+                                data = data.frame(Sample = DY2206_meta_filt_mapping$Sample,
+                                                  lon = DY2206_meta_filt_mapping$decimalLongitude,
+                                                  lat = DY2206_meta_filt_mapping$decimalLatitude),
+                                proj4string = src.proj), ant.proj))
+
+}
+Lat_Lon_converted<- convert_ant(data = DY2206_meta_filt_mapping) %>% dplyr::select(-c("lat","lon"))
+
+
+# join converted data with map:
+DY2206_meta_filt_mapping_v2 <- DY2206_meta_filt_mapping %>% left_join(Lat_Lon_converted) %>% unique()
+```
+
+```{r fig9, fig.align = "center", warning=FALSE, results='hide', echo=FALSE}
+# map with bargraphs:
+Alaska_map + 
+  geom_point(data = DY2206_meta_filt_mapping_v2, aes(x = coords.x1, y = coords.x2, fill=temp), 
+             size=4, shape=21, color="black") +
+  # geom_text(data = unique_n_yr, aes(10000, 500000, label = n_lab)) +
+  theme_bw() +
+  labs(fill=expression(Temp*degree*C), y="Latitude",x="Longitude") +
+  scale_fill_cmocean(name="thermal") +
+  # scale_fill_gradient(low = "blue", high = "white",guide=guide_colorbar(frame.colour = "black", ticks.colour = "black")) +
+  theme(plot.title = element_text(hjust=0.5, size=14),
+        axis.text.x=element_text(angle=45, hjust=1),
+        text=element_text(size=20),
+        legend.background = element_rect(size = 0.5, colour = 1))
+
+
+ggsave(
+ file = here::here("figures", "DY2206_Alaska_Samples.png"),
+ width = 15,
+ height = 8, limitsize = FALSE
+)
+
+```
+
+## Heatmap of Thalassiosira Occurence:
+
+## Presence and absence of Species for each region:
+
+```{r warning=FALSE}
+all_ps_surf_pa <- all_ps_surf %>% 
+  # transform_sample_counts(function(x) ifelse(x > 0, 1, 0))
+  tax_transform("pa",rank=NA)
+
+# Convert phyloseq object to a dataframe:
+Th_ps_surf_pa<-subset_taxa(all_ps_surf_pa, Genus=="Thalassiosira") %>% 
+  psmelt() %>% 
+  dplyr::rename(pres=Abundance) %>% # rename presence/absence columns
+  mutate(temp_int=as.factor(round(temp,1))) %>% # create a new column with rounded temperature
+  mutate(Temp_gp=case_when(temp<2 ~ "0-2",
+                           temp>=2 ~ "2-3")) %>%
+  group_by(Temp_gp, Genus, Species) %>% 
+  summarise(occurence=sum(pres)) %>%
+  mutate(presence=ifelse(occurence > 0, 1, 0)) %>%
+  group_by(Temp_gp, Genus, Species) %>% filter(sum(occurence) >= 1) %>% # remove species without occurence at the surface.
+  ungroup() %>%
+  complete(Temp_gp, Genus,Species,fill = list(presence = 0, occurence = 0)) %>% # add zeros for species and temperature combos that were not observed.
+  mutate(presence=as.factor(presence)) %>% # convert presence to a factor.
+  mutate(Species=str_replace(Species,"_", " "))# remove underscore from species id.
+  
+  
+```
+
+Occurence heatmap with species
+
+```{r fig10, fig.align = "center", warning=FALSE}
+# Change the order of Species:
+Th_ps_surf_pa_v2 <- Th_ps_surf_pa %>%
+  filter(Species!="Thalassiosira Genus") %>%
+  mutate(Species=as.factor(Species)) %>%
+  mutate(Species=fct_relevel(Species,c("Thalassiosira antarctica",
+                                       "Thalassiosira delicatula","Thalassiosira minima",
+                                       "Thalassiosira anguste-lineata",
+                                       "Thalassiosira nordenskioeldii")),#"Thalassiosira Genus")),
+         Temp_gp=fct_relevel(Temp_gp, "0-2"))
+
+# Heatmap of presence/absence of each HAB by metabarcoding region:
+Th_ps_surf_pa_geomtile<- ggplot(Th_ps_surf_pa_v2, aes(x = Temp_gp, y = reorder(Species, dplyr::desc(Species)), fill = presence)) +
+  geom_tile(color = "black", size=1) +
+  # geom_text(aes(label=occurence), color="black") +
+  scale_fill_manual(breaks = c( "1","0"), 
+                       values=c("#B9CBFA", "white"), # (other color options, navy blue:#192B41)
+                       labels=c("Present","Absent")) +
+  scale_x_discrete(labels = ~ paste0(.x, "\u00B0","C")) +
+  labs(fill="Occurence",y="Species",x="Temperature") +
+  theme_classic() +
+  theme(axis.text.y = element_text(face = "italic"),
+        text=element_text(size=20))
+
+# "#F1CA5C","#965D85"
+# show plot
+Th_ps_surf_pa_geomtile
+
+# save figure
+ggsave(
+  file = here::here("figures","Dyson_2022_Th_pres_occ.png"),
+  width = 7,
+  height = 4, limitsize = FALSE
+)
+
+```
+
+Occurence heatmap with ASVs
+
+```{r warning=FALSE}
+# Convert phyloseq object to a dataframe:
+Th_genus_surface<-subset_taxa(all_ps_surf_pa, Species=="Thalassiosira Genus") %>% 
+  psmelt() %>% 
+  left_join(asv_seq_id %>% dplyr::select("ASV","seq_id"), by=c("unique"="seq_id")) %>%
+  dplyr::select(-"OTU") %>%
+  dplyr::rename(pres=Abundance) %>% # rename presence/absence columns
+  mutate(temp_int=as.factor(round(temp,1))) %>% # create a new column with rounded temperature
+  mutate(Temp_gp=case_when(temp<2 ~ "0-2",
+                           temp>=2 ~ "2-3")) %>%
+  group_by(Temp_gp, Species, ASV) %>% 
+  summarise(occurence=sum(pres)) %>%
+  mutate(presence=ifelse(occurence > 0, 1, 0)) %>%
+  group_by(Temp_gp, Species, ASV) %>% filter(sum(occurence) >= 1) %>% # remove species without occurence at the surface.
+  ungroup() %>%
+  complete(Temp_gp,Species,ASV,fill = list(presence = 0, occurence = 0)) %>% # add zeros for species and temperature combos that were not observed.
+  mutate(presence=as.factor(presence)) # convert presence to a factor.
+  
+```
+
+Only those unidentified to species level
+
+```{r fig11, fig.align = "center", warning=FALSE}
+# Change the order of Species:
+Th_genus_surface_v2 <- Th_genus_surface %>%
+  mutate(ASV=as.factor(ASV),
+         Temp_gp=fct_relevel(Temp_gp, "0-2"))
+
+# Heatmap of presence/absence of each HAB by metabarcoding region:
+Th_genus_surf_geomtile<- ggplot(Th_genus_surface_v2, aes(x = Temp_gp, y = ASV, fill = presence)) +
+  geom_tile(color = "black", size=1) +
+  geom_text(aes(label=occurence), color="black") +
+  scale_fill_manual(breaks = c( "1","0"), 
+                       values=c("#B9CBFA", "white"), # (other color options, navy blue:#192B41)
+                       labels=c("Present","Absent")) +
+  scale_x_discrete(labels = ~ paste0(.x, "\u00B0","C")) +
+  labs(fill="Occurence",y="ASV",x="Temperature", title="Thalassiosira sp.") +
+  theme_classic() +
+  theme(axis.text.y = element_text(face = "italic"),
+        title=element_text(face="italic"),
+        text=element_text(size=20))
+# show plot
+Th_genus_surf_geomtile
+
+# save figure
+ggsave(
+  file = here::here("figures","Dyson_2022_Th_genus_occ.png"),
+  width = 8,
+  height = 8, limitsize = FALSE
+)
+
+```
+
+All ASVs
+
+```{r fig12, fig.align = "center", warning=FALSE}
+# Convert phyloseq object to a dataframe:
+Th_genus_all_sp_surface<-subset_taxa(all_ps_surf_pa, Genus=="Thalassiosira") %>% 
+  psmelt() %>% 
+  left_join(asv_seq_id %>% dplyr::select("ASV","seq_id"), by=c("unique"="seq_id")) %>%
+  dplyr::select(-"OTU") %>%
+  dplyr::rename(pres=Abundance) %>% # rename presence/absence columns
+  mutate(temp_int=as.factor(round(temp,1))) %>% # create a new column with rounded temperature
+  mutate(Temp_gp=case_when(temp<2 ~ "0-2",
+                           temp>=2 ~ "2-3")) %>%
+  group_by(Temp_gp, Species, ASV) %>% 
+  summarise(occurence=sum(pres)) %>%
+  mutate(presence=ifelse(occurence > 0, 1, 0)) %>%
+  group_by(Temp_gp, Species, ASV) %>% filter(sum(occurence) >= 1) %>% # remove species without occurence at the surface.
+  ungroup() %>%
+  complete(Temp_gp,ASV,fill = list(presence = 0, occurence = 0)) %>% # add zeros for species and temperature combos that were not observed.
+  mutate(presence=as.factor(presence)) %>%# convert presence to a factor. 
+  arrange(ASV, Species) %>% # arrange dataframe so the ASVs are in order to be filled
+  fill(Species)
+
+# Change the order of Species:
+Th_genus_all_sp_surface_v2 <- Th_genus_all_sp_surface %>%
+  mutate(Species=str_replace(Species,"_", " "),
+         ASV=str_replace(ASV,"_", " ")) %>% # remove underscore from species id.
+  mutate(ASV=as.factor(ASV),
+         Temp_gp=fct_relevel(Temp_gp, "0-2"),
+         Species=fct_relevel(Species,c("Thalassiosira anguste-lineata","Thalassiosira antarctica",
+                                       "Thalassiosira delicatula","Thalassiosira minima",
+                                       "Thalassiosira nordenskioeldii","Thalassiosira Genus"))) # re-order species levels
+  
+# Heatmap of presence/absence of each HAB by metabarcoding region:
+Th_genus_all_sp_surf_geomtile<- ggplot(Th_genus_all_sp_surface_v2, aes(x = Temp_gp, y = ASV, fill = presence)) +
+  geom_tile(color = "black", size=1) +
+  geom_text(aes(label=occurence), color="black") +
+  scale_fill_manual(breaks = c( "1","0"), 
+                       values=c("#B9CBFA", "white"), # (other color options, navy blue:#192B41)
+                       labels=c("Present","Absent")) +
+  scale_x_discrete(labels = ~ paste0(.x, "\u00B0","C")) +
+  labs(fill="Occurence",y="",x="Temperature") +
+  facet_grid(Species ~ ., scales="free_y", space="free", switch = "y") +
+  theme_classic() +
+  theme(text=element_text(size=20),
+        strip.placement = "outside",
+        strip.text.y = element_text(face="italic"),
+        strip.text.y.left = element_text(angle = 0),
+        strip.background = element_blank())
+# show plot
+Th_genus_all_sp_surf_geomtile
+
+# save figure
+ggsave(
+  file = here::here("figures","Dyson_2022_Th_genus_all_sp_occ.png"),
+  width = 9,
+  height = 8, limitsize = FALSE
+)
+
+```
+
+
+## RDA of phytoplankton community with temp: *Note:After running through analysis, not ideal with only one variable, so back to NMDS with temperature filled in*
+
+Following GUSTAME tutorial
+
+Transform counts to presence/absence
+
+```{r warning=FALSE, message=FALSE}
+# save otu table:
+all_ps_filt_otu<-t(otu_table(all_ps_filt)) %>% data.frame()
+
+# save environmental data:
+dy2206_surf_phyto_env<-sample_data(all_ps_filt) %>% 
+  data.frame() %>%
+  rownames_to_column(var="Sample") %>%
+  dplyr::select("Sample","temp")
+
+# save taxonomy table:
+dy2206_surf_phyto_taxa<-tax_table(all_ps_filt) %>% data.frame()
+
+# Use decostand to transform sample counts to presence/absence (pa):
+dy2206_surf_phyto_presabs <- decostand(all_ps_filt_otu, "pa")
+
+# Run a decorona analysis to determine if species distribution is linear or uni-modal:
+dca_raw_phytos<-decorana(dy2206_surf_phyto_presabs)
+dca_raw_phytos
+
+```
+
+
+To decide whether to apply linear or unimodal ordination method on your data, you can use the rule of thumb introduced by Lepš & Šmilauer (2003): first, calculate DCA (detrended by segments) on your data, and check the length of the first DCA axis (which is scaled in units of standard deviation, S.D.). The length of first DCA axis > 4 S.D. indicates a heterogeneous dataset on which unimodal methods should be used, while the length < 3 S.D. indicates a homogeneous dataset for which linear methods are suitable (see Fig. 5. In the grey zone between 3 and 4 S.D., both linear and unimodal methods are OK. Note that while linear methods should not be used for heterogeneous data, unimodal methods can be used for homogeneous data, but linear methods, in this case, are more powerful and should be preferred. Alternatively, if your data are heterogeneous, but you still want to use linear ordination methods (PCA, RDA), apply them on Hellinger transformed species composition data to calculate ordination based on Hellinger distances (as recommended e.g. by Legendre & Gallagher (2001)). 
+
+**Axis length for DY2206 all phytos was less than 3 and therefore linear methods (RDA) is appropriate.**
+
+Normality of untransformed environmental data: temp
+
+```{r fig12, fig.align = "center"}
+# Statistical test for normality:
+shapiro.test(dy2206_surf_phyto_env$temp)
+
+# Check distribution of final list of environmental variables to include:
+qqnorm(dy2206_surf_phyto_env$temp, main="qqnorm DIN"); qqline(dy2206_surf_phyto_env$temp, col = 2,lwd=2,lty=2)
+
+```
+
+Conclusion: normality assumptions met!
+
+Could apply z-score to environmental data, but only looking at temperature, so not neccessary (if more than one environmental this is important so they are on the same scale).
+
+### calculate the tb-RDA (since pres-absence)
+
+```{r}
+# RDA analysis:
+dy2206_RDA<-rda(dy2206_surf_phyto_presabs ~ temp, data=dy2206_surf_phyto_env, na.action=na.omit) 
+dy2206_RDA
+
+# Overall test of the significance of the analysis 
+anova(dy2206_RDA) 
+# test axes for sig. Or, we may calculate the significance of each constrained axis independently. This can be done by adding argument by = “axis” (by default, the argument by is set to NULL, see the helpfile ?anova.cca). The calculation takes rather long (there are 14 constrained axes, each tested separately); you may speed it up using parallel calculation if your computer has more than one core (use the argument parallel with the number of available cores, four in the case of my computer). Also, we will directly store the results into an object (test_axis) so as we can call it later for further processing: 
+test_axis<- anova(dy2206_RDA, by = "axis", perm.max = 999)
+test_axis
+
+# Adjust p-values for multiple tests:
+test_axis.adj <- test_axis
+test_axis.adj$`Pr(>F)` <- p.adjust (test_axis$`Pr(>F)`, method = 'holm')
+test_axis.adj
+
+
+# test for significance of env. variables; however this tests sequentially adds each variable one by one in order in which they enter the model formula, and for each calculates partial explained variation and its significance with previous variables as covariables (i.e. for the first variable it is marginal variation explained by this variable and its significance, for the second variable it is partial variation explained by the second variable after removing the variation of the first variable as covariable, etc.). Since variables in the dataset are ordered without exact meaning, this option is not useful here. 
+anova(dy2206_RDA, by = "terms", permu = 999)
+
+
+# by = “margin”, testing the variance explained by each explanatory variable with all the others used as covariables (independently from their order in the model): 
+anova(dy2206_RDA, by = "margin", permu = 999)
+```
+
+Statistical output:
+- ANOVA of RDA model: F(1,3)=1.59, p=0.01667
+
+How much variation is explained by each axis
+
+```{r fig13, fig.align = "center"}
+constrained_eig <- dy2206_RDA$CCA$eig/dy2206_RDA$tot.chi*100
+unconstrained_eig <- dy2206_RDA$CA$eig/dy2206_RDA$tot.chi*100
+expl_var <- c(constrained_eig, unconstrained_eig)
+barplot (expl_var[1:20], col = c(rep ('red', length (constrained_eig)), rep ('black', length (unconstrained_eig))),
+         las = 2, ylab = '% variation')
+
+```
+Check RDA plot:
+
+Type 2: Angles between variables reflect their correlation. Longer arrows mean this variable strongly drives the variation in the community matrix, Arrows pointing in opposite directions have a negative relationship, Arrows pointing in the same direction have a positive relationship.
+
+Type 1: Distances among objects reflect their similarities. Sites (numbers) that are closer together have more similar communities, Species that are closer together occupy more sites in common.
+
+```{r fig14, fig.align = "center"}
+# Type 2 scaling
+ordiplot(dy2206_RDA, scaling = 2, type = "text")
+
+```
+
+Save ouptput for plotting:
+
+```{r fig.align = "center"}
+# Custom triplot code!
+
+## extract % explained by the first 2 axes
+perc <- round(100*(summary(dy2206_RDA)$cont$importance[2, 1:2]), 2)
+
+## extract scores - these are coordinates in the RDA space
+site_df <- scores(dy2206_RDA, display="sites", choices=c(1,2), scaling=2)
+df_species <- as.data.frame(scores(dy2206_RDA, display="species", choices=c(1,2), scaling=2))
+env_rda_sig <- scores(dy2206_RDA, display="bp", choices=c(1, 2), scaling=2)
+env_rda_sig <- as.data.frame(env_rda_sig)
+env_rda_sig$env<-row.names(env_rda_sig)
+
+```
+
+Customize Plot:
+
+```{r fig15, fig.align = "center"}
+## Custom triplot, step by step
+
+# re-name value:
+env_rda_sig2 <- env_rda_sig %>%
+mutate(env=replace(env, env=="temp", "Temperature"))
+
+# COlors for plots from ggsci: https://cran.r-project.org/web/packages/ggsci/vignettes/ggsci.html
+Regionpal = pal_uchicago("default")(3)
+Regionpal
+
+# Add transect_id colors to rda:
+site_df<-as.data.frame(site_df)
+site_df$Sample <- row.names(site_df)
+site_df_env<-left_join(site_df, dy2206_surf_phyto_env, by="Sample")
+
+# now for plotting, first the sample sites:
+rda_plot <- ggplot() + 
+  geom_point(data=site_df_env, aes(x=RDA1, y=PC1, fill=temp),shape=21, color="black", size=3) +
+  scale_fill_gradient(low = "blue", high = "red",guide=guide_colorbar(frame.colour = "black", ticks.colour = "black")) +
+  geom_hline(yintercept=0, linetype="dotted") +
+  geom_vline(xintercept=0, linetype="dotted") +
+  xlab(paste0("RDA1 (", perc[1],"%)")) +
+  ylab(paste0("PCA1 (", perc[2],"%)")) +
+  # labs(fill="Region") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=0.5),
+        panel.background = element_blank(),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.key=element_blank())
+
+# Then the environment
+rda_biplot<-rda_plot +
+  geom_segment(data=env_rda_sig2, aes(x=0, xend=RDA1, y=0, yend=PC1), arrow=arrow(length = unit(0.03, "npc"), type="closed"), size = 0.7, colour = "black") +
+  geom_text(data=env_rda_sig2, aes(x=RDA1, y=PC1,label=env), size=4, color="black", fontface="bold", nudge_x = 0.05, nudge_y = 0.2) +
+  theme(legend.title=element_text(size=18), 
+        legend.text=element_text(size=18))
+
+rda_biplot
+
+ggsave(
+  file = here::here("figures", "DY2206_allPhytos_rda.png"),
+  width = 6,
+  height = 6, limitsize = FALSE
+)
+```
+
+## Save environmental data to match to satellite data:
+
+```{r fig16, fig.align = "center"}
+# save environmental data:
+dy2206_surf_phyto_env<-sample_data(all_ps_filt) %>% 
+  data.frame() %>%
+  rownames_to_column(var="Sample") %>%
+  dplyr::select("Sample","decimalLatitude","decimalLongitude","temp","minimumDepthInMeters","maximumDepthInMeters")
+
+
+DY2206_for_sat<-read_delim(here(data_dir,
+                                  "SKQ_Alaska_Analysis",
+                                  "SKQ_Alaska_data",
+                                  "processed",
+                                  "dy2206_faire.csv")) %>%
+  mutate(samp_name=gsub("\\-", ".", samp_name)) %>%
+  dplyr::rename("Sample"=samp_name) %>%
+  filter(Sample %in% dy2206_surf_phyto_env$Sample)  %>%
+  dplyr::select("Sample",
+                "decimalLatitude",
+                "decimalLongitude",
+                "temp",
+                "minimumDepthInMeters",
+                "maximumDepthInMeters",
+                "eventDate",
+                "verbatimEventDate",
+                "verbatimEventTime")
+
+
+# save as csv:
+write_csv(DY2206_for_sat, file = here("data","DY2206_OME_meta.csv"))
+```
+
+#### Software and package versions used for file:
+
+```{r warning=FALSE}
+print(sessionInfo(), locale = FALSE)
+```
+

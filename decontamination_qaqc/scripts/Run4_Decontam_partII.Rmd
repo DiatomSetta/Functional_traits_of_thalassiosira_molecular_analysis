@@ -1,0 +1,315 @@
+---
+title: "Run1 OME Taxonomy Comparison Decontamination PartII"
+author: "Sam Setta"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Goal of Script
+
+Set filtering method for ASV decontamination, steps we decided on:
+
+**Part I Processing steps**
+
+ * Step 1: Merge reads only (DONE)
+ * Step 2: Tag jumping/index hopping
+ * Step 3: Remove negative control contaminants.
+ * Step 4: Remove the positive and negative control samples.
+ * Step 5: Remove known contaminants (human, food products, pets, lab controls, etc.). Remove off-targets (i.e. taxonomic: bacteria/archaea in the MiFish; or length based). Leave in unknowns.
+
+Produce Part I filtered output file
+
+**Part II: Merge with other runs if neccessary - THIS SCRIPT**
+
+**Part III Processing steps**
+
+ * Step 6: Extreme low sample depth pass (# reads < number dependent on platform)
+ * Step 7: Extreme low diversity pass (remove sample with one ASV > 99.9% of the sample).
+ * Step 8: Dissimilarity between PCR (biological) replicates [Sample Filtering]
+
+Produce Part II filtered output file
+
+**Part IV Processing steps**
+
+ * Step 9: Remove singletons [helps computational load]
+ * Step 10: Pattern of Presence (remove ASVs only found in one sample or user value) or Site Occupancy Modeling [ASV filtering]
+ * Step 11: Remove n-ton (user defined ASV min) [ASV filtering]
+ * Step 12: Removing low complexity samples x% one ASV [Sample filtering]. User defined (optional).
+ * Step 13: Remove unknowns (optional) [ASV filtering]
+ * Step 14: Low sample depth pass/discard PCR replicates of low depth (aka 40k or confidence %) [Sample Filtering]
+
+Following: https://github.com/zjgold/gruinard_decon
+
+More details on how each works copied for the Readme:
+
+**Estimation of Tag-jumping or Index Hopping**
+
+With this procedure, we substract the proportion of reads that jumped into control samples from each environmental sample. First we determine which ASVs came from controls vs environmental samples. Next we create a vector of ASVs in positive controls. We then calculate what proportion of the reads found in the positive controls are found in environment samples. Next, we substract the composition of the positive controls from the environment samples. The idea behind this procedure is that we now know how many reads from each ASV appeared in the controls. These come from 2 processes: sequences we know should appear in the positive controls, and sequences that have hopped from the environment to the positive controls.
+
+**Discarding PCR replicates with low number of reads**
+We fit the sample read depth to a beta distribution. We then discard samples below the 5% probability level.
+
+**Site Occupancy Modeling**
+Site occupancy modeling is used to asses whether an ASV is a true rare sequence or likely contaminant. We first identify the pattern of presence of each ASV across biological and technical replicates. We then estimate the occupancy probability of each ASV pattern across replicates based on the pattern of presesence across all samples. We then filter out ASVs with low occupancy probabilities.
+
+For our purposes, since we don't have 'site' occupancy, can filter at a certain read number across a certain number of samples.
+
+Load libraries
+
+```{r setup, warning=FALSE, message=FALSE}
+# install libraries
+# BiocManager::install(c("tidyverse", "lubridate", "RColorBrewer", "ggsci", "dplyr", "phyloseq", "knitr", "readxl","ggplot2","NatParksPalettes","purrr", "ggvenn", "zetadiv"))
+
+library("tidyverse")
+# library("ggplot2") loads with tidyverse
+# library("stringr") loads with tidyverse
+# library("dplyr") loads with tidyverse
+# library("tibble") loads with tidyverse
+library("proxy")
+library("reshape2")
+library("microDecon")
+library("knitr")
+library("vegan")
+library("phyloseq")
+library("DESeq2")
+library("ape")
+library("RColorBrewer")
+library("ggsci")
+library("knitr")
+library("readxl")
+library("here")
+library("digest")
+# packages I don't think I'll use:
+# library("ranacapa")
+# library("plotly")
+library("optparse")
+# library("fitdistrplus")
+# library("rstan")
+# library("shinystan")
+# library("bayesplot")
+# library("broom")
+library("configr")
+library("Biostrings")
+library("NatParksPalettes")
+# library("zetadiv")
+here()
+
+source(here("SKQ_Alaska_Analysis","SKQ_Alaska_scripts","decontamination","decontamination_utilities.R"))
+
+```
+
+## Set-Up for decontamination
+
+### Load config file for processing.
+
+```{r warning=FALSE, message=FALSE}
+# load config file of variables for script
+option_list <- list(
+  make_option(c("-c", "--config"), type="character", default="decontam_post-merge_18Sv4.yaml",
+              help="Path to configuration file [default %default]", metavar="FILE")
+)
+
+opt_parser <- OptionParser(option_list=option_list)
+opt <- parse_args(opt_parser)
+# check if yaml
+is.yaml.file(opt$config)
+eval.config.sections(opt$config)
+config_file <- read.config(opt$config)
+
+```
+
+## Load data:
+
+For other OME runs, can load sample metadata file for project and filter sample id's in that file.
+
+```{r warning=FALSE, message=FALSE}
+# Load all run data from nested asv into R and merge:
+nested.results <- list()
+
+for (run in config_file$runs_for_project) {
+  
+    nested.file <- readRDS(here(
+      config_file$parent_dir,run,"processed","decontam_QAQC",
+      config_file$region,"Output_R","ASV.nested_final_partI.RDS"))
+    
+    fasta.file <- readDNAStringSet(here(
+      config_file$parent_dir,run,config_file$fasta_file),
+      format ="fasta") %>%
+      as.data.frame() %>%
+      rownames_to_column(var="ASV") %>%
+      dplyr::rename("sequence" = `x`) %>%
+      mutate(seq_id=map_chr(sequence, ~ digest(.x, algo = "md5", serialize = FALSE)))
+    
+    trimmed_nested_file<-
+      nested.file %>% dplyr::select(Step5.non.target) %>%
+      unnest(Step5.non.target) %>%
+      unique() %>%
+      pivot_wider( # pivot wider so read counts are now below each sample name
+        names_from = sample,
+        values_from = reads,
+        values_fill = list(reads = 0)
+      )  %>% 
+      mutate(iter = run) %>%
+      left_join(fasta.file, by="seq_id") %>% relocate(sequence, .after="seq_id")
+    
+    nested.results[[run]] <- trimmed_nested_file
+    
+}
+    filtered_asv_tables <- bind_rows(nested.results) %>%
+      dplyr::rename("sum.taxonomy" = Taxon) 
+    
+# add hash key to dataframe: (Added in partI)
+# filtered_asv_tables <- 
+#  filtered_asv_tables %>%
+#      mutate(hash_md5=map_chr(sequence, ~ digest(.x, algo = "md5", serialize = FALSE))) %>%
+#  relocate(hash_md5,.after="sequence")
+
+```
+
+Load metadata files
+
+*Note: for all other runs load sample metadata and filter the ASV table by only sdamples found in the project sample metadata file*
+
+```{r warning=FALSE, message=FALSE}
+# Load all run data from nested asv into R and filter asv by metadata output:
+metadata_file<- read_csv(here(config_file$parent_dir,run,"processed","dy2206_faire.csv")) %>%
+  mutate(samp_name=gsub("\\-", ".", samp_name))
+
+# filter asv table using metadata:
+filtered_asv_tables_v2 <-
+  filtered_asv_tables %>%
+  dplyr::select(any_of(c("seq_id", "sequence", "sum.taxonomy", metadata_file$samp_name))) 
+```
+
+## Merge identical ASVs
+
+```{r warning=FALSE, message=FALSE}
+# only run if more than one run included:
+if (length(config_file$runs_for_project) >1) {
+# select columns in dataframe for merge:
+asv_og_columns <-
+  filtered_asv_tables_v2 %>% 
+  dplyr::select("seq_id","sequence", "sum.taxonomy","iter")
+
+# sum ASVs that have identical sequences:
+merged_hash_counts <- filtered_asv_tables_v2 %>%
+   dplyr::select(-c("seq_id","sum.taxonomy","iter","sequence")) %>%
+  group_by("seq_id") %>%
+    plyr::ddply(., "seq_id",plyr::numcolwise(sum))
+
+# join the merged hash with the sequence, sum.taxonomy, ASV and iter:
+merged_asvs_counts <- filtered_asv_tables_v2 %>%
+  group_by(seq_id,sequence) %>%
+    summarise(
+      iter = paste(unique(na.omit(iter)), collapse = ","),
+      seq_id = paste(unique(na.omit(seq_id)), collapse = ",")) %>% 
+    left_join(merged_hash_counts)
+  
+} else {
+    merged_asvs_counts <- filtered_asv_tables_v2 
+    message("Project sequenced within one sequencing run - skipping asv merge step")
+  }
+
+```
+
+Save merged file
+
+```{r warning=FALSE, message=FALSE}
+# create output directories:
+dir.create(here(config_file$parent_dir,config_file$output_path), recursive = TRUE)
+dir.create(here(config_file$parent_dir,config_file$output_path,"Output_csv"), recursive = TRUE)
+dir.create(here(config_file$parent_dir,config_file$output_path,"Output_R"), recursive = TRUE)
+dir.create(here(config_file$parent_dir,config_file$output_path,"Output_plots"), recursive = TRUE)
+
+# Save merged file:
+write_csv(merged_asvs_counts, file = here(config_file$parent_dir,config_file$output_path,"Output_csv","partII_merged.csv"))
+```
+
+## Format merged data into nested and summary file format:
+
+### Nested file
+
+```{r warning=FALSE, message=FALSE}
+# Save region from config file:
+region <- config_file$region
+
+# Columns to gather across:
+gathercols <- merged_asvs_counts %>%
+  ungroup() %>%
+  dplyr::select(-c("seq_id","sequence","sum.taxonomy")) %>%
+  colnames() 
+
+# turn into nested file format:
+merged_long<-
+merged_asvs_counts %>%
+  filter(rowSums(select(., -c("seq_id","sequence","sum.taxonomy")))> 0) %>% # remove any seq_ids with sum of 0 now that only one project included
+  pivot_longer(
+    .,
+    cols = all_of(gathercols),
+    names_to = "sample",
+    values_to = "reads"
+  )
+
+# join with taxonomy:
+merged_long<- merged_long %>%
+  # left_join(filtered_asv_tables %>% 
+  #             dplyr::select(c("seq_id","sum.taxonomy")), by="seq_id") %>%
+  mutate(Miseq_region=region,
+         Sample_type="Sample") %>%
+  relocate(c("sum.taxonomy", "Miseq_region","Sample_type"), .after = seq_id)
+
+# created nested dataframe:
+ASV.nested<- merged_long %>%
+  ungroup() %>%
+    dplyr::group_by(Miseq_region, Sample_type) %>%
+    nest() %>%
+    pivot_wider(names_from = Sample_type, values_from = data)
+
+
+```
+
+### Summary file
+
+```{r warning=FALSE, message=FALSE}
+# Summary file of merged reads:
+ASV.summary <- ASV.nested %>%
+    dplyr::mutate(., Miseq_region, Summary = purrr::map(Sample, ~ how.many(ASVtable = ., round = "Merged")), .keep = "none")
+  ASV.summary$Summary
+
+```
+
+### Save rds files to bring into partIII
+
+```{r warning=FALSE, message=FALSE}
+# Save summary and nested data
+saveRDS(ASV.nested, file = here(config_file$parent_dir,config_file$output_path,"Output_R","ASV.nested_final_partII.RDS"))
+saveRDS(ASV.summary, file = here(config_file$parent_dir,config_file$output_path,"Output_R","ASV.summary_final_partII.RDS"))
+
+```
+
+## Final formatting of files before moving to Part III
+
+```{r warning=FALSE, message=FALSE}
+# save final files as csv files
+# ASVs and fasta combined
+partII_ASV_final_output <- merged_long %>%
+    pivot_wider( # pivot wider so read counts are now below each sample name
+      names_from = sample,
+      values_from = reads,
+      values_fill = list(reads = 0)
+    )
+# metadata file: Only neccessary if combining projects (point to sample metadata)
+partII_meta_final_output <- metadata_file %>%
+  filter(samp_name %in% merged_long$sample)
+
+# save metadata and asv file:
+write_csv(partII_ASV_final_output, file = here(config_file$parent_dir,config_file$output_path,"Output_csv","asv_final_partII.csv"))
+write_csv(partII_meta_final_output, file = here(config_file$parent_dir,config_file$output_path,"Output_csv","meta_final_partII.csv"))
+
+```
+
+#### Software and package versions used for file:
+
+```{r warning=FALSE}
+print(sessionInfo(), locale = FALSE)
+```

@@ -1,0 +1,738 @@
+---
+title: "Run1 OME Taxonomy Comparison Decontamination PartIV"
+author: "Sam Setta"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Goal of Script
+
+Set filtering method for ASV decontamination, steps we decided on:
+
+**Part I Processing steps**
+
+ * Step 1: Merge reads only (DONE)
+ * Step 2: Tag jumping/index hopping
+ * Step 3: Remove negative control contaminants.
+ * Step 4: Remove the positive and negative control samples.
+ * Step 5: Remove known contaminants (human, food products, pets, lab controls, etc.). Remove off-targets (i.e. taxonomic: bacteria/archaea in the MiFish; or length based). Leave in unknowns.
+
+Produce Part I filtered output file
+
+**Part II: Merge with other runs if neccessary**
+
+**Part III Processing steps**
+
+ * Step 6: Extreme low sample depth pass (# reads < number dependent on platform)
+ * Step 7: Extreme low diversity pass (remove sample with one ASV > 99.9% of the sample).
+ * Step 8: Dissimilarity between PCR (biological) replicates [Sample Filtering]
+
+Produce Part III filtered output file
+
+**Part IV Processing steps - THIS SCRIPT**
+
+ * Step 9: Remove singletons [helps computational load]
+ * Step 10: Pattern of Presence (remove ASVs only found in one sample or user value) or Site Occupancy Modeling [ASV filtering]
+ * Step 11: Remove n-ton (user defined ASV min) [ASV filtering]
+ * Step 12: Removing low complexity samples x% one ASV [Sample filtering]. User defined (optional).
+ * Step 13: Remove unknowns (optional) [ASV filtering]
+ * Step 14: Low sample depth pass/discard PCR replicates of low depth (aka 40k or confidence %) [Sample Filtering]
+
+Produce Part IV filtered output file
+
+Following: https://github.com/zjgold/gruinard_decon
+
+More details on how each works copied for the Readme:
+
+**Estimation of Tag-jumping or Index Hopping**
+
+With this procedure, we substract the proportion of reads that jumped into control samples from each environmental sample. First we determine which ASVs came from controls vs environmental samples. Next we create a vector of ASVs in positive controls. We then calculate what proportion of the reads found in the positive controls are found in environment samples. Next, we substract the composition of the positive controls from the environment samples. The idea behind this procedure is that we now know how many reads from each ASV appeared in the controls. These come from 2 processes: sequences we know should appear in the positive controls, and sequences that have hopped from the environment to the positive controls.
+
+**Discarding PCR replicates with low number of reads**
+We fit the sample read depth to a beta distribution. We then discard samples below the 5% probability level.
+
+**Site Occupancy Modeling**
+Site occupancy modeling is used to asses whether an ASV is a true rare sequence or likely contaminant. We first identify the pattern of presence of each ASV across biological and technical replicates. We then estimate the occupancy probability of each ASV pattern across replicates based on the pattern of presesence across all samples. We then filter out ASVs with low occupancy probabilities.
+
+For our purposes, since we don't have 'site' occupancy, can filter at a certain read number across a certain number of samples.
+
+Load libraries
+
+```{r setup, warning=FALSE, message=FALSE}
+# install libraries
+# BiocManager::install(c("tidyverse", "lubridate", "RColorBrewer", "ggsci", "dplyr", "phyloseq", "knitr", "readxl","ggplot2","NatParksPalettes","purrr", "ggvenn", "zetadiv"))
+
+library("tidyverse")
+# library("ggplot2") loads with tidyverse
+# library("stringr") loads with tidyverse
+# library("dplyr") loads with tidyverse
+# library("tibble") loads with tidyverse
+library("proxy")
+library("reshape2")
+library("microDecon")
+library("knitr")
+library("vegan")
+library("phyloseq")
+library("DESeq2")
+library("ape")
+library("RColorBrewer")
+library("ggsci")
+library("knitr")
+library("readxl")
+library("here")
+# packages I don't think I'll use:
+# library("ranacapa")
+# library("plotly")
+library("optparse")
+# BiocManager::install("fitdistrplus")
+library("fitdistrplus")
+# library("rstan")
+# library("shinystan")
+# library("bayesplot")
+# library("broom")
+library("configr")
+library("Biostrings")
+library("NatParksPalettes")
+# library("zetadiv")
+here()
+
+source(here("SKQ_Alaska_Analysis","SKQ_Alaska_scripts","decontamination","decontamination_utilities.R"))
+
+```
+
+## Set-Up for decontamination
+
+### Load config file for processing.
+
+```{r warning=FALSE, message=FALSE}
+# load config file of variables for script
+option_list <- list(
+  make_option(c("-c", "--config"), type="character",
+              default="decontam_post-merge_18Sv4.yaml",
+              help="Path to configuration file [default %default]", metavar="FILE")
+)
+
+opt_parser <- OptionParser(option_list=option_list)
+opt <- parse_args(opt_parser)
+# check if yaml
+is.yaml.file(opt$config)
+eval.config.sections(opt$config)
+config_file <- read.config(opt$config)
+
+```
+
+### Load data
+
+```{r warning=FALSE, message=FALSE}
+# Load summary ASV file:
+ASV.summary<- readRDS(here(
+        config_file$parent_dir,
+        config_file$output_path,
+        "Output_R","ASV.summary_final_partIII.RDS"))
+
+# Load nested ASV file:
+ASV.nested <- readRDS(here(
+        config_file$parent_dir,
+        config_file$output_path,
+        "Output_R","ASV.nested_final_partIII.RDS"))
+
+```
+
+## Step 9: Remove singletons
+
+### Pull out Sample Read Depth
+
+```{r warning=FALSE, message=FALSE}
+### Format table, remove Singletons, add to ASV.nested file:
+ASV.nested <- ASV.nested %>%
+  mutate(Step9.singletons_removed = purrr::map(Step.8.rep_outliers_removed, function(.x) { 
+    .x %>%
+        ungroup() %>%
+        dplyr::group_by(seq_id) %>% # group by hash (merged across projects)
+        mutate(TotalReadsperASV = sum(reads)) %>% # sum reads per ASV
+        filter(., TotalReadsperASV > 1) %>% # apply singletons cutoff (of 1 read per ASV)
+        ungroup() %>%
+        dplyr::select(-TotalReadsperASV)
+    }))
+```
+
+#### Add to ASV summary:
+
+```{r warning=FALSE, message=FALSE}
+## Add remaining ASVs to summary
+ASV.summary <- ASV.nested %>%
+  dplyr::mutate(Miseq_region,
+    Summary.1 = purrr::map(
+      Step9.singletons_removed,
+      ~ how.many(ASVtable = ., round = "9.singletons.removed")), .keep="none"
+  ) %>%
+  left_join(ASV.summary) %>%
+  mutate(Summary = map2(Summary, Summary.1, bind_rows)) %>%
+  dplyr::select(-Summary.1)
+
+# view table of remaining reads and samples:
+ASV.summary$Summary[[1]]
+## Calculate % ASVs Kept
+asv_step9_summary <- as.data.frame(ASV.summary$Summary) %>% 
+  pivot_wider(names_from = "Stat", values_from = "number") %>% 
+  filter(Stage=="Step_9.singletons.removed")
+asv_step8_summary <- as.data.frame(ASV.summary$Summary) %>% 
+  pivot_wider(names_from = "Stat", values_from = "number") %>% 
+  filter(Stage=="Step_8.Rep.outliers_removed")
+
+# difference in ASVs (seq_id's):
+paste0(round(asv_step9_summary$nHashes[[1]] / asv_step8_summary$nHashes[[1]] * 100, 2), "% ASVs retained")
+# difference in total reads:
+paste0(round(asv_step9_summary$nReads[[1]] / asv_step8_summary$nReads[[1]]* 100, 2), "% reads retained")
+
+```
+
+## Step 10: Remove ASVs found only in one sample or use Site Occupancy Modeling.
+
+### Step 10.1 Summarise occurences
+
+```{r warning=FALSE, message=FALSE}
+## Calculate occurrence, total read count, and total sample count
+step_10_occurrences_reads <- ASV.nested %>%
+  dplyr::select(Step9.singletons_removed) %>%
+  unnest(Step9.singletons_removed) %>% # This stage is a long table
+  ungroup() %>%
+  dplyr::select("seq_id","sample","reads") %>% # select only ASV (seq_id), sample, and reads
+  group_by(seq_id) %>%
+  mutate(occurrences_perASV=count(reads > 0), # add occurence column by the number of times the seq_id is not 0.
+         K = n_distinct(sample, na.rm=TRUE)) %>% # number of samples
+  group_by(seq_id,occurrences_perASV,K) %>% # add variables that don't change with seq_id that need to be in final output
+  summarise(tot_reads=sum(reads)) %>% unique() # claculate the total reads per seq_id (ASV)
+```
+
+Plot histogram of occurrences
+
+```{r warning=FALSE, message=FALSE}
+## Visualize histogram of occurrences
+plot_1_histogram <- step_10_occurrences_reads %>%
+  ggplot() +
+  geom_histogram(aes(log10(occurrences_perASV))) +
+  ggtitle(label = "Histogram of occurrencess") +
+  ylab("Count") +
+  xlab("Log10(Occurrences)") + theme_bw()
+
+# save plot
+ggsave(
+  plot = plot_1_histogram,
+  here(config_file$parent_dir,
+        config_file$output_path,
+        "Output_plots",
+       "step10_Histogram_of_occurrences.png"),
+  device = "png",
+  width = 12,
+  height = 8,
+  units = "in"
+)
+
+# view plot:
+plot_1_histogram
+
+```
+
+Plot the reads vs occurrences
+
+```{r warning=FALSE, message=FALSE}
+## Visualize read counts versuses occurrences
+plot_2_reads_vs_occ <- step_10_occurrences_reads %>%
+  ggplot() +
+  geom_point(aes(x = log10(occurrences_perASV), y = log10(tot_reads))) +
+  ggtitle(label = "Reads versus Occurrences") +
+  ylab("log10(nReads)") +
+  xlab("log10(Occurrences)")
+
+ggsave(
+  plot = plot_2_reads_vs_occ,
+ here(config_file$parent_dir,
+        config_file$output_path,"Output_plots",
+       "step10_nReads_versus_Occurrences_across_all_samples.png"),
+  device = "png",
+  width = 12,
+  height = 8,
+  units = "in"
+)
+```
+
+### Step 10.2 Filter by Pattern of Presence (low occurrences)
+
+```{r warning=FALSE, message=FALSE}
+## Summarize Occurrence Thresholds
+step_10_occurrences_reads_classified <- step_10_occurrences_reads %>%
+  mutate(., threshold_ASV_occ = 
+           case_when(
+             occurrences_perASV > 1 & occurrences_perASV <= 3 ~ "2", # if only including ASVs in 2 or 3 samples
+             occurrences_perASV > 3 & occurrences_perASV <= 10  ~ "4", # if only including ASVs in 4-9 samples
+             occurrences_perASV > 10 ~ "11", # if only including ASVs in at least 11 samples
+             TRUE ~ "Occurs in 1 sample" # if only including ASVs in 1 sample
+    )
+  )
+
+# summarise number of reads that would be removed with each filtering threshold:
+step_10_reads <- step_10_occurrences_reads_classified %>%
+  ungroup() %>%
+  mutate(., total = sum(tot_reads)) %>%
+  group_by(threshold_ASV_occ, total) %>%
+  dplyr::summarise(tot_reads = sum(tot_reads)) %>%
+  mutate(., perc_reads = paste0(round(100 * tot_reads / total, 2), "%")) %>%
+  dplyr::select(-total)
+# and number of ASVs that would be removed with each filtering threshold to number of reads removed:
+step_10_counts_reads <- step_10_occurrences_reads_classified %>%
+  ungroup() %>%
+  dplyr::count(threshold_ASV_occ) %>%
+  mutate(., total = sum(n)) %>%
+  mutate(per_ASVs = paste0(round(100 * n / total, 2), "%")) %>%
+  dplyr::select(-total) %>% left_join(step_10_reads)
+
+# save output as csv:
+write_csv(step_10_counts_reads, file = here(config_file$parent_dir,config_file$output_path,"Output_csv","step10.PresOfOcc_summary.csv"))
+```
+
+Add filtering threshold and save to nested and summary files
+
+```{r warning=FALSE, message=FALSE}
+### Add to ASV.nested
+ASV.nested <- ASV.nested %>%
+  mutate(Step10.tibble.occurrence = purrr::map(Step9.singletons_removed, function(.x) {
+    .x %>%
+      left_join(step_10_occurrences_reads_classified %>% dplyr::select(-c("K","tot_reads"))) %>%
+      filter(., occurrences_perASV >= eval(parse(text=print(config_file$step10_occurrence_thresh, quote=F))))
+  }))
+
+### Summary.file
+ASV.summary <- ASV.nested %>%
+  dplyr::mutate(Miseq_region,
+    Summary.1 = purrr::map(
+      Step10.tibble.occurrence,
+      ~ how.many(ASVtable = ., round = "10.Occurrences")), .keep="none"
+  ) %>%
+  left_join(ASV.summary) %>%
+  mutate(Summary = map2(Summary, Summary.1, bind_rows)) %>%
+  dplyr::select(-Summary.1)
+
+ASV.summary$Summary[[1]]  
+
+```
+
+## Step 11: Remove n-ton (user defined ASV min) [ASV filtering]
+
+### Pull out Sample Read Depth 
+
+n-ton filtering
+
+```{r warning=FALSE, message=FALSE}
+if (config_file$step11_filt_option=="n-ton") {
+  message("Step 11: ASV n-ton filtering")
+    ## Calculate occurence, total read count, and total sample count
+    step_11_nton_filt <- ASV.nested %>%
+      dplyr::select(Step10.tibble.occurrence) %>%
+      unnest(Step10.tibble.occurrence) %>% # This stage is a long table
+      ungroup() %>% 
+      group_by(seq_id) %>% # group by hash (merged across projects)
+      mutate(TotalReadsperASV = sum(reads)) %>% # sum reads per ASV
+            mutate(threshold_nton_filt=case_when( # add levels to n-ton filtering
+              TotalReadsperASV > 1 &  TotalReadsperASV < 10 ~ "2",
+              TotalReadsperASV >= 10 ~ "10",
+              TRUE ~ "Singleton")) %>% # more of a sanity check, this should not be true!
+            ungroup() %>%
+      group_by(threshold_nton_filt) %>%
+      mutate(tot_reads=sum(reads))
+    
+    # summarise number of reads that would be removed with each filtering threshold:
+    step_11_reads <- step_11_nton_filt %>%
+      ungroup() %>%
+      dplyr::select(threshold_nton_filt, tot_reads) %>% unique() %>%
+      dplyr::mutate(total = sum(tot_reads)) %>%
+      mutate(., perc_reads = paste0(round(100 * tot_reads / total, 2), "%")) %>%
+      dplyr::select(-total)
+    
+    # and number of ASVs that would be removed with each filtering threshold to number of reads removed:
+    step_11_counts_reads <- step_11_nton_filt %>%
+      ungroup() %>%
+      dplyr::select(threshold_nton_filt, seq_id) %>% unique() %>%
+      dplyr::count(threshold_nton_filt) %>%
+      mutate(., total = sum(n)) %>%
+      mutate(per_ASVs = paste0(round(100 * n / total, 2), "%")) %>%
+      dplyr::select(-total) %>% left_join(step_11_reads)
+    
+    # save output as csv:
+    write_csv(step_11_counts_reads, file =
+                here(config_file$parent_dir,config_file$output_path,"Output_csv","step11.nton_summary.csv"))
+} else {
+  message("Skip - Step 11: ASV n-ton filtering")
+}
+
+```
+
+Percent total reads ASV filtering
+
+```{r warning=FALSE, message=FALSE}
+if (config_file$step11_filt_option=="perc_reads") {
+  message("Step 11: ASV % total reads filtering")
+    ## Calculate occurence, total read count, and total sample count
+    step_11_percTot_filt <- ASV.nested %>%
+      dplyr::select(Step10.tibble.occurrence) %>%
+      unnest(Step10.tibble.occurrence) %>% # This stage is a long table
+      ungroup() %>% 
+      dplyr::select(seq_id, sample, reads) %>%
+      unique() %>%
+      # pivot_wider(names_from = sample, values_from = reads) %>%
+      group_by(seq_id) %>% 
+      summarise(TotalReadsperASV=sum(reads)) %>%
+      mutate(Total_reads=sum(TotalReadsperASV),
+             perc_total=TotalReadsperASV/Total_reads) %>%
+      arrange(desc(perc_total)) 
+      
+    # save output as csv:
+    write_csv(step_11_percTot_filt, file =
+                here(config_file$parent_dir,config_file$output_path,"Output_csv","step11.ASV.perc_summary.csv"))
+} else {
+  message("Skip - Step 11: ASV % total reads filtering")
+}
+
+```
+
+#### Add to ASV nested and summary:
+
+```{r warning=FALSE, message=FALSE}
+if (config_file$step11_filt_option=="n-ton") {
+  message("Step 11: ASV n-ton filtering")
+  ### Add to ASV.nested
+  ASV.nested <- ASV.nested %>%
+    mutate(Step11.ASV.filt = purrr::map(Step10.tibble.occurrence, function(.x) {
+      .x %>%
+        left_join(step_11_nton_filt %>% dplyr::select(-c("tot_reads"))) %>%
+        filter(., TotalReadsperASV >= eval(parse(text=print(config_file$step11_nton_thresh, quote=F))))
+    }))
+} else {
+  message("Step 11: ASV % Total reads filtering")
+  ### Add to ASV.nested
+  ASV.nested <- ASV.nested %>%
+    mutate(Step11.ASV.filt = purrr::map(Step10.tibble.occurrence, function(.x) {
+      .x %>%
+        left_join(step_11_percTot_filt %>% dplyr::select(-c("TotalReadsperASV","Total_reads"))) %>%
+        filter(., perc_total >= eval(parse(text=print(config_file$step11_perc_reads, quote=F))))
+    }))
+  
+}
+```
+
+Add to summary file:
+
+```{r warning=FALSE, message=FALSE}
+### Summary.file
+ASV.summary <- ASV.nested %>%
+  dplyr::mutate(Miseq_region,
+    Summary.1 = purrr::map(
+      Step11.ASV.filt,
+      ~ how.many(ASVtable = ., round = "11.ASV.filt")), .keep="none"
+  ) %>%
+  left_join(ASV.summary) %>%
+  mutate(Summary = map2(Summary, Summary.1, bind_rows)) %>%
+  dplyr::select(-Summary.1)
+
+ASV.summary$Summary[[1]]
+
+```
+
+## Step 12: (Optional) Removing low complexity x% of sample comprised of one ASV [Sample filtering].
+
+Filter samples by low complexity user defined value, default it 1 in config_file which won't remove any samples for this step.
+
+```{r warning=FALSE, message=FALSE}
+## Identify samples that have greater than 99% of ASVs
+asv_prop <- ASV.nested %>%
+    dplyr::select(Step11.ASV.filt) %>% # pos contaminants removed tibble
+    unnest(Step11.ASV.filt) %>% # unnest tibble to work with
+    dplyr::select(seq_id, reads, sample) %>% # select only necessary columns
+    pivot_wider( # pivot wider so read counts are now below each sample name
+      names_from = sample,
+      values_from = reads,
+      values_fill = list(reads = 0)
+    ) %>% 
+  # calculate the porportion each ASV makes of the the total reads per sample
+  mutate(across(-c("seq_id"), ~ .x/sum(.x))) %>%
+  pivot_longer(cols = starts_with("E"),
+               names_to = "sample",
+               values_to = "prop_reads") %>% 
+  filter(prop_reads > config_file$step12_prop) # identify samples that have ASVs that make up greater than 99% of reads.
+
+## Filter out samples with extreme low diversity:
+ASV.nested <- ASV.nested %>%
+  mutate(step.12_low_div_pass = 
+           purrr::map(Step11.ASV.filt, 
+                      ~ filter(., !sample %in% asv_prop$sample))
+  )
+
+### Summary.file
+ASV.summary <- ASV.nested %>%
+  dplyr::mutate(Miseq_region,
+    Summary.1 = purrr::map(
+      step.12_low_div_pass,
+      ~ how.many(ASVtable = ., round = "12.low.sample.complexity")), .keep="none"
+  ) %>%
+  left_join(ASV.summary) %>%
+  mutate(Summary = map2(Summary, Summary.1, bind_rows)) %>%
+  dplyr::select(-Summary.1)
+
+ASV.summary$Summary[[1]]
+
+```
+
+## Step 13: Remove unknowns (optional) [ASV filtering]
+
+```{r warning=FALSE, message=FALSE}
+### Filter by Taxonomic Paths
+# This list can be expanded upon additional work to identify known contaminants within OME PMEL samples
+if (file.exists(config_file$step13_unknown_characters_to_remove_path)) {
+  step13_species_to_remove <- read.csv(here(config_file$parent_dir,
+                                            config_file$step13_unknown_characters_to_remove_path))$Domain
+  
+} else {
+  step13_species_to_remove <- c("Unknown","unknown","unclassified","Unclassified","Environmental Unknown","Unassigned","NA")
+  
+}
+
+```
+
+If step13_remove=TRUE in config file, remove seq_id with unknown Domains, if not keep everything.
+
+```{r warning=FALSE, message=FALSE}
+## Identify ASVs (seq_id) that have unknown Domains
+step13_species_to_remove <- ASV.nested %>%
+    dplyr::select(step.12_low_div_pass) %>% # pos contaminants removed tibble
+    unnest(step.12_low_div_pass) %>% # unnest tibble to work with
+    dplyr::select(seq_id, sum.taxonomy, sample) %>% # select only necessary columns
+  separate_wider_delim( # Separate out sample id to get cruise id
+    sum.taxonomy,
+    delim = ";",
+    names = "Domain", # separating columns
+    too_few = "align_end",
+    too_many = "drop",
+    cols_remove = FALSE
+  ) %>%
+  filter(Domain %in% step13_species_to_remove | is.na(Domain))
+
+## Filter out samples with unknowns
+if (config_file$step13_remove==TRUE) {
+  message("Step 13: ASVs with unknown Domains removed")
+  ASV.nested <- ASV.nested %>% 
+    mutate(step.13_unknown_removed =
+             purrr::map(step.12_low_div_pass,
+                        ~ filter(., !seq_id %in% step13_species_to_remove$seq_id))
+  )
+
+  } else { # If there isn't a positive control output message
+    message("Step 13: samples not filtered out by taxonomy")
+    ASV.nested <- ASV.nested %>% 
+      mutate(step.13_unknown_removed = step.12_low_div_pass)
+    
+  }
+
+### Summary.file
+ASV.summary <- ASV.nested %>%
+  dplyr::mutate(Miseq_region,
+    Summary.1 = purrr::map(
+      step.13_unknown_removed,
+      ~ how.many(ASVtable = ., round = "13.unk.removed")), .keep="none"
+  ) %>%
+  left_join(ASV.summary) %>%
+  mutate(Summary = map2(Summary, Summary.1, bind_rows)) %>%
+  dplyr::select(-Summary.1)
+
+ASV.summary$Summary[[1]]
+
+```
+
+## Step 14: Low sample depth pass/discard PCR replicates of low depth (aka 40k or confidence %) [Sample Filtering]
+
+- If step14_depth_filt is 0 in config file, this step will be skipped if greater than 0 all reads below the cutoff will be filtered out.
+
+### Pull sample read depth out:
+
+```{r warning=FALSE, message=FALSE}
+# Get the summary of total ASVs per region per sample
+all.reps <- ASV.nested %>%
+  dplyr::select(Miseq_region, step.13_unknown_removed) %>%
+  unnest(step.13_unknown_removed) %>%
+  group_by(Miseq_region, sample) %>%
+  dplyr::summarise(tot_step14 = sum(reads)) %>%
+  arrange(desc(tot_step14)) %>% ungroup()
+
+# Calculate reads per sample:
+reads.per.sample <- all.reps %>%
+  filter(., tot_step14 > 100) %>%
+  pull(tot_step14)
+
+names(reads.per.sample) <- all.reps %>%
+  filter(., tot_step14 > 100) %>%
+  pull(sample)
+```
+
+#### Visualize Read Counts Across Samples before Step 14 filtering:
+
+```{r warning=FALSE, message=FALSE}
+plot_step13 <- ggplot(all.reps, aes(x = tot_step14)) +
+  geom_histogram(binwidth=1000, fill="darkgrey", color="black") +
+  geom_vline(xintercept = 10000, color="red") +
+  geom_vline(xintercept = 8000, color="red", linetype = "dashed") +
+  theme_bw()
+
+ggsave(
+  plot = plot_step13,
+  here(config_file$parent_dir,config_file$output_path,"Output_plots","step13_Sample_Read_Depth.png"),
+  device = "png",
+  width = 12,
+  height = 8,
+  units = "in"
+)
+
+```
+
+### Normal distribution of reads:
+
+```{r warning=FALSE, message=FALSE}
+### Fit Normal Distribution
+fit <- fitdist(
+  reads.per.sample,
+  "gamma",
+  lower = c(0, 0),
+  start = list(scale = 1, shape = 1)
+)
+
+all.reps <- all.reps %>%
+  mutate(prob = pgamma(
+    tot_step14,
+    shape = fit$estimate[[2]],
+    scale = fit$estimate[[1]],
+    lower.tail = TRUE,
+    log.p = FALSE
+  )) %>% ungroup()
+
+### Remove Outlier Samples
+outliers <- all.reps %>%
+  filter(tot_step14 < config_file$step14_depth_filt)
+
+## what would be removed if used probability:
+all.reps %>%
+  mutate(
+    .,
+    Step14_read_depth_flag = if_else(
+      prob < config_file$step14_low_dist_probability_cutoff, 
+      # changed to 0.05 to save the two samples
+      "Warning Low Read Depth",
+      "Ok"
+    )
+  ) %>%
+  filter(., Step14_read_depth_flag != "Ok")
+
+## Add to ASV.nested
+ASV.nested <- ASV.nested %>%
+  mutate(step.14_low_depth_pass = purrr::map(step.13_unknown_removed, ~ filter(., !sample %in% outliers$sample) %>%
+        left_join(all.reps) %>%
+          ungroup() %>%
+        dplyr::select(-c("Miseq_region")) %>%
+        mutate(Step14_read_depth_flag = if_else(
+            prob < config_file$step14_low_dist_probability_cutoff,
+            "Warning Low Read Depth",
+            "Ok"))
+    )
+  )
+
+```
+
+### Add to summary file
+
+```{r warning=FALSE, message=FALSE}
+### Summary.file
+ASV.summary <- ASV.nested %>%
+  dplyr::mutate(Miseq_region,
+    Summary.1 = purrr::map(
+      step.14_low_depth_pass,
+      ~ how.many(ASVtable = ., round = "14.low.read.depth")), .keep="none"
+  ) %>%
+  left_join(ASV.summary) %>%
+  mutate(Summary = map2(Summary, Summary.1, bind_rows)) %>%
+  dplyr::select(-Summary.1)
+
+ASV.summary$Summary[[1]]
+
+```
+
+
+## Save final nested files:
+
+```{r warning=FALSE, message=FALSE}
+# Save summary and nested data
+saveRDS(ASV.nested, file = here(config_file$parent_dir,
+                                config_file$output_path,
+                                "Output_R","ASV.nested_final_partIV.RDS"))
+saveRDS(ASV.summary, file = here(config_file$parent_dir,
+                                 config_file$output_path,
+                                 "Output_R","ASV.summary_final_partIV.RDS"))
+
+```
+
+## Save final format of decontaminated dataframe:
+
+### Save final output file of all data:
+
+```{r warning=FALSE, message=FALSE}
+# final filtered dataframe:
+decontam_final_output<-ASV.nested %>%
+  dplyr::select(Miseq_region, step.14_low_depth_pass) %>%
+  unnest(step.14_low_depth_pass)
+# save dataframe as csv:
+write_csv(decontam_final_output, here(here(config_file$parent_dir,
+                                           config_file$output_path,
+                                           "Output_csv","Decontam_final_output.csv")))
+```
+
+### Save final data as asv, taxonomy and metadata files
+
+- ASV table of reads
+- metadata file
+- taxonomy table
+
+```{r warning=FALSE, message=FALSE}
+# ASV table:
+partIV_ASV_final_output <- decontam_final_output %>% dplyr::select("seq_id","sample","reads") %>%
+  pivot_wider( # pivot wider so read counts are now below each sample name
+      names_from = sample,
+      values_from = reads,
+      values_fill = list(reads = 0)
+    )
+
+## metadata file:
+partIV_meta_final_output <- read_csv(here(config_file$parent_dir,
+                                          config_file$output_path,
+                                          "Output_csv","meta_final_partIII.csv")) %>% 
+  filter(sample %in% decontam_final_output$sample)
+
+# taxonomy file:
+partIV_taxa_final_output<-decontam_final_output %>% dplyr::select("seq_id","sum.taxonomy")
+
+## save outputs
+# save asv tables
+write_csv(partIV_ASV_final_output, file = here(config_file$parent_dir,
+                                               config_file$output_path,
+                                               "Output_csv","Decontam_final_asv_table.csv"))
+# save taxonomy table
+write_csv(partIV_taxa_final_output, file = here(config_file$parent_dir,
+                                                config_file$output_path,
+                                                "Output_csv","Decontam_final_taxonomy_table.csv"))
+# save metadata file
+write_csv(partIV_meta_final_output, file = here(config_file$parent_dir,
+                                                config_file$output_path,
+                                                "Output_csv","Decontam_final_metadata.csv"))
+
+```
+
+#### Software and package versions used for file:
+
+```{r warning=FALSE}
+print(sessionInfo(), locale = FALSE)
+```

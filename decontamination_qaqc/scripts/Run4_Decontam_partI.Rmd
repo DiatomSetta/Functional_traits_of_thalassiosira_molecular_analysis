@@ -1,0 +1,1275 @@
+---
+title: "Run4 Decontamination"
+author: "Sam Setta"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Goal of Script
+
+Set filtering method for ASV decontamination, steps we decided on:
+
+**Part I Processing steps - THIS SCRIPT**
+
+ * Step 1: Merge reads only (DONE)
+ * Step 2: Tag jumping/index hopping
+ * Step 3: Remove negative control contaminants.
+ * Step 4: Remove the positive and negative control samples.
+ * Step 5: Remove known contaminants (human, food products, pets, lab controls, etc.). Remove off-targets (i.e. taxonomic: bacteria/archaea in the MiFish; or length based). Leave in unknowns.
+
+Produce Part I filtered output file
+
+Following: https://github.com/zjgold/gruinard_decon
+
+More details on how each works copied for the Readme:
+
+**Estimation of Tag-jumping or Index Hopping**
+
+With this procedure, we substract the proportion of reads that jumped into control samples from each environmental sample. First we determine which ASVs came from controls vs environmental samples. Next we create a vector of ASVs in positive controls. We then calculate what proportion of the reads found in the positive controls are found in environment samples. Next, we substract the composition of the positive controls from the environment samples. The idea behind this procedure is that we now know how many reads from each ASV appeared in the controls. These come from 2 processes: sequences we know should appear in the positive controls, and sequences that have hopped from the environment to the positive controls.
+
+Load libraries
+
+```{r setup, warning=FALSE, message=FALSE}
+# install libraries
+# BiocManager::install(c("tidyverse", "lubridate", "RColorBrewer", "ggsci", "dplyr", "phyloseq", "knitr", "readxl","ggplot2","NatParksPalettes","purrr", "ggvenn", "zetadiv"))
+
+library("tidyverse")
+# library("ggplot2") loads with tidyverse
+# library("stringr") loads with tidyverse
+# library("dplyr") loads with tidyverse
+# library("tibble") loads with tidyverse
+library("proxy")
+library("reshape2")
+library("microDecon")
+library("knitr")
+library("vegan")
+library("phyloseq")
+library("DESeq2")
+library("ape")
+library("RColorBrewer")
+library("ggsci")
+library("knitr")
+library("readxl")
+library("here")
+library("openssl")
+# packages I don't think I'll use:
+# library("ranacapa")
+# library("plotly")
+library("optparse")
+# library("fitdistrplus")
+# library("rstan")
+# library("shinystan")
+# library("bayesplot")
+# library("broom")
+library("configr")
+library("Biostrings")
+library("NatParksPalettes")
+# library("zetadiv")
+here()
+
+source(here("scripts","decontamination","decontamination_utilities.R"))
+
+```
+
+## Set-Up for decontamination
+
+### Load config file for processing.
+
+```{r load-config, warning=FALSE, message=FALSE}
+# load config file of variables for script
+option_list <- list(
+  make_option(c("-c", "--config"), type="character", default="decontam_pre-merge_16Sv4.yaml",
+              help="Path to configuration file [default %default]", metavar="FILE")
+)
+
+opt_parser <- OptionParser(option_list=option_list)
+opt <- parse_args(opt_parser)
+# check if yaml
+is.yaml.file(opt$config)
+eval.config.sections(opt$config)
+config_file <- read.config(opt$config)
+# what metabarcoding region are we working with?
+config_file$region
+
+```
+
+### Load data
+
+```{r load-data, warning=FALSE, message=FALSE}
+# create output directories:
+dir.create(here(config_file$output_path,"Output_csv"), recursive = TRUE)
+dir.create(here(config_file$output_path,"Output_R"), recursive = TRUE)
+dir.create(here(config_file$output_path,"Output_plots"), recursive = TRUE)
+# load metadata file: (period in sample name rather than underscore)
+metadata_file <- read_csv(
+  config_file$input_meta_path
+) 
+  
+# load asv table: (underscore in sample name rather than period)
+asv_table <- read.table(
+  config_file$input_ASV_path_1,
+  header = 1,
+  sep = "\t",
+  stringsAsFactors = F
+)
+
+# format asv table
+if("seq_id" %in% asv_table) {
+  asv_table_1 <- asv_table %>%
+                      rename_with(~ str_remove(., "^MP_"))
+  }else{
+        asv_table_1 <- asv_table %>%
+                      dplyr::rename("seq_id" = x) %>%
+                      rename_with(~ str_remove(., "^MP_"))
+}
+
+# load fasta file
+fasta_table_1 <- readDNAStringSet(config_file$input_fasta_path_1,
+  format =
+    "fasta"
+)
+
+# format fasta file
+fasta_df <- as.data.frame(fasta_table_1) %>%
+  as_tibble(rownames = "ASV") %>%
+  dplyr::rename("Sequence" = `x`) %>%
+  mutate(seq_id = as.character(md5(Sequence)))
+
+# load taxonomy file
+taxonomy_table <- read.table(
+  config_file$input_taxonomy_path_1,
+  header = 1,
+  sep = "\t",
+  stringsAsFactors = F
+) 
+
+# format taxonomy table
+if("Taxon" %in% taxonomy_table) {
+  taxonomy_table_1 <- taxonomy_table %>%
+                      dplyr::rename("ASV" = `Feature.ID`) %>%
+                      left_join(fasta_df %>% select(c("ASV","seq_id"))) %>%
+                      mutate(Taxon = str_remove(Taxon, ";$"))
+  }else{
+        taxonomy_table_1 <- taxonomy_table %>%
+                      unite("Taxon", -ASV, sep=";", remove=TRUE) %>%
+                      left_join(fasta_df %>% select(c("ASV","seq_id")))
+}
+
+```
+
+### Create a dataframe of sequence lengths:
+```{r seq-length-df, warning=FALSE}
+# function to output sequence length from each file:
+seq_len_df<-as.data.frame(fasta.seqlengths(config_file$input_fasta_path_1,
+               nrec=-1L, skip=0L, 
+               seek.first.rec=FALSE,
+               seqtype="B", 
+               use.names=TRUE)) %>%
+    rownames_to_column(., var = "ASV") %>%
+    rename_with(~ "Seq_length",2) %>%
+    left_join(fasta_df %>% select(c("ASV","seq_id"))) %>% select(-"ASV")
+# save file of sequence length
+write_csv(seq_len_df, 
+            here(config_file$output_path,"Output_csv","Step0.seq.length.csv"))
+
+```
+
+### Format data
+
+Metadata:
+
+```{r format-metadata, warning=FALSE, message=FALSE}
+# format metadata file
+metadata <- metadata_file %>%
+  mutate(region=case_when( # create region column to filter by for decontam.
+        assay_name=="ssu16sv4v5_parada" ~ "16Sv4",
+        assay_name=="ssu18sv4_stoeck" ~ "18Sv4",
+        assay_name=="ssu18sv9_amaralzettler" ~ "18Sv9",
+        assay_name=="COI_1835-2198_lerayfolmer" ~ "COI",
+        assay_name=="ssu12sv5v6_mifish_u_sales" ~ "12S",
+        assay_name=="lsu16s_2434-2571_kelly" ~ "16SKelly",
+        assay_name=="ssu18sv8_machida" ~ "18SMachida",
+        assay_name=="ITS1_sterling" ~ "ITS1"
+  )) %>%
+  mutate(samp_name=gsub("[.-]", "_", samp_name)) %>% # remove the cruise code after dash, since dada2 (revamp) output doesn't have this (ASV table)
+  mutate(perc_reads_retained=(output_read_count/input_read_count)*100) %>% # calculate percent reads retained (from raw reads to final ASV assignment)
+  #filter(region %in% config_file$region) %>% # only keep region of interest
+  mutate(Control_Type=case_when( # add column for blanks, positive controls, or samples
+            str_detect(samp_name, "Blank")  ~ "Blank",
+            str_detect(samp_name, ".NC")  ~ "Blank",
+            str_detect(samp_name, "POSITIVE")  ~ "Positive",
+            TRUE ~ "Sample"
+            ),
+          Sample_Control=case_when( # add column to separate control from environmental samples
+            Control_Type=="Sample" ~ "Sample",
+                                   Control_Type=="Blank" ~ "Control",
+                                   Control_Type=="Positive" ~ "Control"),
+         e_num=str_extract(samp_name, "(?<=E)[0-9]+(?=\\_)")
+         ) 
+```
+
+ASV table:
+
+```{r merge-data, warning=FALSE, message=FALSE}
+# Generate Hash.key (essentially taxonomy table)
+merged_df <- asv_table_1 %>%
+  dplyr::select("seq_id", any_of(metadata$samp_name)) %>% # SOMETHING WRONG HERE, FIX THIS PART!!!!!
+  left_join(taxonomy_table_1) %>%
+  left_join(fasta_df)
+
+# Keep only ASV and taxonomy columns
+hash.key <- merged_df %>%
+  dplyr::select(seq_id, Taxon)
+
+# save metabarcoding region id inmerged dataframe:
+merged_df$Miseq_region <- config_file$region
+```
+
+Add separated taxonomic levels if not already in dataframe
+
+```{r taxa-format, warning=FALSE, message=FALSE}
+## Add Taxonomy if missing:
+if("Species" %in% names(hash.key)) {
+  message("Taxonomy already separated — skipping formatting step")
+} else {
+        if (config_file$taxonomy_format=="nine_level") {
+        hash.key <- separate_wider_delim(hash.key, Taxon, 
+                             names= c("Domain", "Supergroup", "Division", "Subdivision", "Class", 
+                                      "Order", "Family", "Genus", "Species"), 
+                             delim=";", too_few="align_start", too_many="drop", cols_remove = FALSE)
+        } else {
+          hash.key <- separate_wider_delim(hash.key, Taxon, 
+                             names= c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species"), 
+                             delim=";", too_few="align_start", too_many="drop", cols_remove = FALSE) }
+}
+```
+
+### Merge tables (if using more than one and check format)
+
+```{r check-merge-format, warning=FALSE, message=FALSE}
+# Merge All Tables (if using Anacapa taxonomy, but here, just based off revamp)
+merged.table <- merged_df
+# check output"
+# tail(merged.table)
+# head(merged.table)
+
+```
+
+### Convert to long format:
+
+```{r convert-to-long, warning=FALSE, message=FALSE}
+### Format for Long Data
+merged.table$seq_id <- factor(merged.table$seq_id)
+merged.table$Miseq_region <- factor(merged.table$Miseq_region)
+
+# save column names from merged.table:
+columns <- colnames(merged.table)
+# create list of column names to remove
+remove <- c(
+  "ASV",
+  "Taxon",
+  "Miseq_region",
+  "Sequence",
+  "seq_id"
+)
+
+# columns to keep via inverse filtering (all those not found in the 'remove' list)
+gathercols <- columns[!columns %in% remove]
+
+# create long dataframe by using only the sample IDs (those not found in 'remove' or only those found in 'gathercols')
+merged.table_long <- merged.table %>%
+  # select(-remove) %>%
+  # column_to_rownames("ASV") %>%
+  pivot_longer(
+    .,
+    cols = all_of(gathercols),
+    names_to = "sample",
+    values_to = "reads"
+  )
+
+# save reads as numeric
+merged.table_long$reads <- as.numeric(merged.table_long$reads)
+
+merged.table_long %>% filter(str_detect(sample,"POSITIVE"))
+
+```
+
+## Step 1: Merge reads only (DONE)
+
+Need to change this if using anacapa results.
+
+## Step 2: Tag jumping/index hopping 
+
+### 2.1 Nest the dataset by origin of ASVs:
+
+#### Label ASVs identified in positive control, negative control, or Samples
+
+Identify Positives, Negatives, and Samples
+
+```{r id-controls, warning=FALSE, message=FALSE}
+# save percent reads retained as vector:
+reads_retained_con<-metadata %>%
+  dplyr::select("samp_name","perc_reads_retained") 
+
+### New column that labels each ASV as from Positive (control) or Sample
+merged.table_long_v2 <-
+merged.table_long %>%
+  mutate(Control_Type=case_when( # add column for blanks, positive controls, or samples
+            str_detect(sample, "_NC")  ~ "Blank",
+            str_detect(sample, "POSITIVE")  ~ "Positive",
+            TRUE ~ "Sample"
+            ),
+          Sample_Control=case_when( # add column to separate control from environmental samples
+            Control_Type=="Sample" ~ "Sample",
+                                   Control_Type=="Blank" ~ "Control",
+                                   Control_Type=="Positive" ~ "Control"
+            ),
+         Pos = case_when( # Pos column is either Positive or Sample
+          Control_Type=="Positive" ~ "Positive",
+          TRUE ~ "Sample"
+            )
+         ) %>%
+  left_join(reads_retained_con, by = join_by("sample"=="samp_name")) %>% # add percent reads retained and control types
+  filter(reads != 0) # removing empty sequences here bc long format, so just adds more computational time here to include.
+
+```
+
+Create positive control filters:
+
+- % of raw reads retained greater than 30
+- Total reads > 30000
+
+- Flag 1:  “Pass” perc_reads_retained > 30 & TotalReadsperSample > 30000
+- Flag 2: “TooFewReads” perc_reads_retained > 30 & TotalReadsperSample <= 30000
+- Flag 2: “LowReadsRetained” perc_reads_retained <= 30 & TotalReadsperSample > 30000
+- Flag 3: “Fail” perc_reads_retained <= 30 & TotalReadsperSample <= 30000
+
+```{r create-pos-filters, warning=FALSE, message=FALSE}
+# Check if there is a positive control in samples
+if ("Positive" %in% merged.table_long_v2$Control_Type) {
+  message("Positive control found — running code")
+    # create a dataframe to use for positive control tag jumping decision later:
+    pass_pos_filter_df <- merged.table_long_v2 %>%
+      filter(Pos=="Positive") %>%
+      group_by(sample, perc_reads_retained) %>%
+      summarise(TotalReadsperSample = sum(reads)) %>%
+      mutate(Pos_pass_filters=case_when(
+        perc_reads_retained > 30 & TotalReadsperSample > 30000 ~ "pass",
+        perc_reads_retained > 30 & TotalReadsperSample <= 30000 ~ "TooFewReads",
+        perc_reads_retained <= 30 & TotalReadsperSample > 30000 ~ "LowReadsRetained",
+        perc_reads_retained <= 30 & TotalReadsperSample <= 30000 ~ "fail")) %>%
+      mutate(pos_flag=case_when(
+        Pos_pass_filters=="pass" ~ "1",
+        Pos_pass_filters=="TooFewReads" ~ "2",
+        Pos_pass_filters=="LowReadsRetained" ~ "2",
+        Pos_pass_filters=="fail" ~ "3",
+      )) %>%
+      dplyr::select(c(sample,Pos_pass_filters,pos_flag))
+    
+    # merge df and pos_filter_df:
+    merged.table_long_v2 <- merged.table_long_v2 %>%
+      left_join(pass_pos_filter_df)
+
+  } else { # If there isn't a positive control output message
+    message("Positive control not found — skipping analysis")
+  }
+
+```
+
+#### ASVs in positive controls
+
+Beginning of code below will skip analysis if there are no positive controls present in the data.
+
+```{r pos.control.sp, warning=FALSE, message=FALSE}
+# Check if there is a positive control in samples
+if ("Positive" %in% merged.table_long_v2$Control_Type) {
+  message("Positive control found — running code")
+  ## Summarise total number of reads per seq_id
+  all.seqs.in.positives <- merged.table_long_v2 %>%
+    filter(Control_Type == "Positive") %>%
+    dplyr::group_by(seq_id) %>%
+    dplyr::summarise(tot = sum(reads)) %>%
+    arrange(desc(tot)) 
+  
+  ## Pull in associated taxonomy for positive ASVs
+  pos.contam.species <- all.seqs.in.positives %>%
+    left_join(hash.key, by="seq_id") %>%
+    as_tibble() 
+  
+  ## Save ASVs, taxonomy and read counts for positive control samples
+  write_csv(pos.contam.species, file = here(config_file$output_path,"Output_csv","step2_pos.contam.species.csv")
+            )
+} else { # If there isn't a positive control output message
+  message("Positive control not found — skipping analysis")
+}
+```
+
+#### ASVs in negative controls.
+
+Beginning of code below will skip analysis if there are no negative controls present in the data.
+
+```{r blank-contam-sp, warning=FALSE, message=FALSE}
+# Check if there is a positive control in samples
+if ("Blank" %in% merged.table_long_v2$Control_Type) {
+  message("Negative control found — running code")
+
+  ## Summarise total number of reads per ASV
+  all.seqs.in.blanks <- merged.table_long_v2 %>%
+    filter(Control_Type == "Blank") %>%
+    dplyr::group_by(seq_id) %>%
+    dplyr::summarise(tot = sum(reads)) %>%
+    arrange(desc(tot))
+  
+  ## Pull in associated taxonomy for positive ASVs
+  blank.contam.species <- all.seqs.in.blanks %>%
+    left_join(hash.key, by="seq_id") %>%
+    as_tibble() # OLDE CODE, already tibble if counts are included!
+  
+  ## Save ASVs, taxonomy and read counts for negative control samples
+  write.csv(blank.contam.species, here(config_file$output_path,"Output_csv","step2_blank.contam.species.csv"))
+} else { # If there isn't a positive control output message
+  message("Negative control not found — skipping analysis")
+}
+```
+
+#### Visualize Read Counts Across Samples for Barcode_1
+
+```{r read-count-fig, warning=FALSE, message=FALSE}
+plot_1 <- merged.table_long_v2 %>%
+  group_by(sample) %>%
+  # filter(., Miseq_region == barcode_1) %>%
+  mutate(TotalReadsperSample = sum(reads)) %>%
+  arrange(desc(TotalReadsperSample)) %>%
+  ggplot(., aes(x = sample, y = TotalReadsperSample, color = Control_Type)) +
+  geom_point() +
+  ggtitle("Read Count Across Samples") +
+  theme(axis.text.x = element_text(angle = 90))
+
+plot_1
+
+ggsave(
+  plot = plot_1,
+  here(config_file$output_path,"Output_plots","step1_Sample_Read_Depth_Barcode_1.png"),
+  device = "png",
+  width = 12,
+  height = 8,
+  units = "in"
+)
+
+```
+
+#### Add separated taxonomic levels if not already in dataframe
+
+```{r tax-format-2, warning=FALSE, message=FALSE}
+## Add Taxonomy if missing:
+if("Species" %in% names(merged.table_long_v2)) {
+  message("Taxonomy already separated — skipping formatting step")
+} else {
+        if (config_file$taxonomy_format=="nine_level") {
+        merged.table_long_v2 <- separate_wider_delim(merged.table_long_v2, Taxon, 
+                             names= c("Domain", "Supergroup", "Division", "Subdivision", "Class", 
+                                      "Order", "Family", "Genus", "Species"), 
+                             delim=";", too_few="align_start", too_many="drop", cols_remove = FALSE)
+        } else {
+          merged.table_long_v2 <- separate_wider_delim(merged.table_long_v2, Taxon, 
+                             names= c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species"), 
+                             delim=";", too_few="align_start", too_many="drop", cols_remove = FALSE) }
+}
+```
+
+#### Generate nested ASV table
+
+```{r nested-asv, warning=FALSE, message=FALSE}
+## Generated ASV.nested
+ASV.nested<- merged.table_long_v2 %>%
+    dplyr::group_by(Miseq_region, Pos) %>%
+    nest() %>%
+    pivot_wider(names_from = Pos, values_from = data)
+  
+### Summary.file.1 
+ASV.summary <- ASV.nested %>%
+    ungroup() %>%
+    dplyr::mutate(., Miseq_region, Summary = purrr::map(Sample, ~ how.many(ASVtable = ., round = 0)), .keep = "none")
+  ASV.summary$Summary
+
+```
+
+### 2.2: Model the composition of the positive controls of each run
+
+```{r warning=FALSE, message=FALSE}
+# Only run tag jumping in and out of positive controls if positive control in samples:
+if (("Positive" %in% merged.table_long_v2$Control_Type) &&
+     ("pass" %in% merged.table_long_v2$Pos_pass_filters) ) {
+  message("Positive control found & passed filters — running code")
+  #### Jumping vector out of Positive
+ASV.nested <- ASV.nested %>%
+    mutate(contamout.tibble = purrr::map(Sample, function(.x) { # started new nested dataframe in R
+      df <- .x %>%
+        ungroup() %>%
+        group_by(sample) %>%
+        mutate(TotalReadsperSample = sum(reads))  %>% # calculate total reads per sample
+        mutate(proportion = reads / TotalReadsperSample) %>% # calculate proportion of reads per sample
+    # remove known positive control species and other higher level taxonomic:
+    filter(., Taxon == config_file$step1_positive_species_taxonomic_path | # with species
+                 !!sym(config_file$step1_positive_lowest_taxonomic_lvl) == config_file$step1_positive_lowest_taxonomic_lvl_id) %>% # highest level taxonomy of positive 
+        # dplyr::select(-c(Domain:Species)) %>%
+        ungroup() %>%
+        group_by(seq_id)
+      # if positive contamination species are not found in samples (no rows, add NA values)
+      if (nrow(df) == 0) {
+      tibble(seq_id = factor(NA, levels = levels(.x$seq_id)), vector_contamination = NA_real_)
+      # if positive contamination species are found in samples calculate maximum proportions for vector contamination
+    } else {
+      df %>%
+        summarise(vector_contamination = max(proportion, na.rm = FALSE), .groups = "drop")
+    }
+    }))
+ 
+  ### Jumping vector into Positive
+   ASV.nested <- ASV.nested %>%
+    mutate(contam.tibble = purrr::map(Positive, function(.x) { # create new nested dataframe using positive nested dataframe created above
+      .x %>%
+        ungroup() %>%
+        group_by(sample) %>%
+        mutate(TotalReadsperSample = sum(reads)) %>%  # calculate total reads per sample
+        mutate(proportion = reads / TotalReadsperSample) %>% # calculate proportion of reads per sample
+        group_by(seq_id) %>% # this can be changed to Taxon
+        dplyr::summarise(vector_contamination = max(proportion)) # calculate maximum proportions for vector contamination
+    }))
+
+  ### Vector Contamination in Barcode_1 visualization
+  vc_plot_1<- rbind(ASV.nested$contam.tibble[[1]], ASV.nested$contamout.tibble[[1]]) %>% # combine vector contamination for sample (contamout.tibble) and positives (contam.tibble)
+    as.data.frame() %>%
+    ggplot(aes(x = vector_contamination)) + 
+    geom_histogram() # y is the count of ASVs
+  ggsave(
+    plot = vc_plot_1,
+    here(config_file$output_path,"Output_plots","step1_Vector_Contamination_Barcode_1.png"),
+    device = "png",
+    width = 12,
+    height = 8,
+    units = "in"
+  )
+
+} else { # If there isn't a positive control output message
+  message("Positive control not found or didn't pass filters — skipping analysis")
+}
+
+ASV.nested$Positive
+
+
+```
+
+### 2.3: Substract the composition of the positive controls from the environment samples
+
+- This is done ASV by ASV
+- This could be translated to take the highest rate of index hopping observed for any non-positive control ASV and applied across all ASVs
+
+```{r warning=FALSE, message=FALSE}
+# Only run tag jumping in and out of positive controls if positive control in samples:
+if (("Positive" %in% merged.table_long_v2$Control_Type) &&
+     ("pass" %in% merged.table_long_v2$Pos_pass_filters)) {
+  message("Positive control found & passed filters — running code")
+  
+  ## Find out what is the top contaminant across samples (not including known positive ASVs)
+  max_vector_contamination <- rbind(ASV.nested$contam.tibble[[1]], 
+                                    # contaminant proportions in positive controls
+                                    ASV.nested$contamout.tibble[[1]]) %>% # contaminant proportions in negative controls
+    left_join(hash.key) %>% # add taxonomy from taxonomy table
+    # remove known positive control species and genus:
+    filter(., Taxon != config_file$step1_positive_species_taxonomic_path & # with genus
+                 !!sym(config_file$step1_positive_lowest_taxonomic_lvl) != config_file$step1_positive_lowest_taxonomic_lvl_id 
+           & Domain!="Unknown") %>% # with higher level taxonomy
+    # include target taxonomy here
+    arrange(desc(vector_contamination)) %>%
+    dplyr::select(-c(Domain:Species)) %>%
+    dplyr::slice(1) 
+
+  ## Add to ASV.nested
+  
+  ASV.nested <- ASV.nested %>%
+      ungroup() %>%
+      mutate(Step2.cleaned.tibble = purrr::map(Sample, function(.x) {
+        .x %>%
+          dplyr::group_by(sample) %>%
+          mutate(TotalReadsperSample = sum(reads)) %>% # calculate total reads per sample
+          mutate(Updated_nReads = reads - (
+            ceiling(
+              max_vector_contamination$vector_contamination[[1]] * TotalReadsperSample
+            )
+          )) %>%
+          filter(Updated_nReads > 0) %>%
+          ungroup() %>%
+          dplyr::select(sample, seq_id, reads=Updated_nReads) # reads, Updated_nReads, TotalReadsperSample)
+      }))
+    
+    ASVs_retained_step1 <- ASV.nested$Step2.cleaned.tibble[[1]]$seq_id %>% unique()
+  # which species were removed?: 
+ ASV.nested$Sample[[1]] %>%
+   filter(., !seq_id %in% ASVs_retained_step1) %>%
+   group_by(seq_id, Taxon) %>%
+   dplyr::summarise(n(), sum_reads =sum(reads) )%>% View()
+
+  #### create summary file (Summary.file.2) 
+  ASV.summary <- ASV.nested %>%
+    dplyr::mutate(Miseq_region, Summary.2 = purrr::map(Step2.cleaned.tibble, ~ how.many(ASVtable = ., round = "1.Jump")), .keep = "none") %>%
+    left_join(ASV.summary) %>% # use left join when there are many miseq runs to join
+    mutate(Summary = map2(Summary, Summary.2, bind_rows)) %>%
+    dplyr::select(-Summary.2)
+  
+  ASV.summary$Summary
+  
+  } else {
+  message("Positive control not found or didn't pass filters - skipping analysis")
+     ASV.nested <- ASV.nested %>%
+      ungroup() %>%
+      mutate(Step2.cleaned.tibble = purrr::map(Sample, function(.x) {
+      .x %>%
+        dplyr::select(sample, seq_id, reads)
+      }))
+     
+  ## Summary file so we have this step in our dataframe:
+  ASV.summary <- ASV.nested %>%
+    dplyr::mutate(Miseq_region, Summary.2 = purrr::map(Step2.cleaned.tibble, ~ how.many(ASVtable = ., round = "1.Jump")), .keep = "none") %>%
+    left_join(ASV.summary) %>% # use left join when there are many miseq runs to join
+    mutate(Summary = map2(Summary, Summary.2, bind_rows)) %>%
+    dplyr::select(-Summary.2)
+  
+  ASV.summary$Summary
+  
+  }
+
+```
+
+## Step 3: Remove negative control contaminants
+
+### Step 3.1: Investigate contaminants found in negative controls.
+
+```{r warning=FALSE, message=FALSE}
+# Only run negative control analysis if there's a negative control in samples:
+if ("Blank" %in% merged.table_long_v2$Control_Type) {
+  message("Negative control found — running code")
+
+  ## load in negative controls as separate df:
+  neg_controls <- merged.table_long_v2 %>% # create dataframe of only samples that are negative controls.
+    filter(Control_Type=="Blank") # only blanks (negative controls)
+
+  ## Generate Long Data Frame of Negative Controls
+  negative_long <- ASV.nested %>%
+    dplyr::select(Step2.cleaned.tibble) %>% # pos contaminants removed tibble
+    unnest(Step2.cleaned.tibble) %>% # unnest tibble to work with
+    filter(sample %in% neg_controls$sample) # keep only negative control samples
+
+  negative_long <- ASV.nested$Blanks[[1]] # save negative control long format data frame in nested table
+
+  ### Reads per Contaminant:
+  negative_reads <- negative_long %>%
+      group_by(seq_id) %>%
+      dplyr::summarise(sum_reads_neg = sum(reads)) %>% # summarise total reads per ASV in blanks
+      left_join(hash.key) %>% # join with taxonomy (to see taxa of contaminants)
+      arrange(desc(sum_reads_neg)) # order ASVs with highest counts first
+  
+  negative_reads
+
+} else {
+  message("Negative control not found - skipping analysis")
+  }
+```
+
+### Step 3.2: Calculations with contaminants in negative controls.
+
+```{r warning=FALSE, message=FALSE}
+# Only run negatice control analysis if there's a negative control in samples:
+if ("Blank" %in% merged.table_long_v2$Control_Type) {
+  message("Negative control found — running code")
+  
+  ### Generate Read Counts across all samples and negative controls:
+  read_counts_step3 <- ASV.nested %>%
+      dplyr::select(Step2.cleaned.tibble) %>% # pos contaminants removed tibble
+      unnest(Step2.cleaned.tibble) %>% # This stage is a long table
+      ungroup() %>% # unnest tibble to work with
+      group_by(seq_id) %>% 
+      dplyr::summarise( # summarize read counts per ASV
+        sum_reads = sum(reads), # Total reads per ASV
+        mean_reads = mean(reads), # Mean reads per ASV
+        median_reads = median(reads), # Median reads per ASV
+        max_reads = max(reads), # Max reads per ASV
+        sd_reads = sd(reads), # SD reads per ASV
+        min_reads = min(reads) # Minimum reads per ASV
+        ) %>%
+    arrange(desc(sum_reads))
+  
+  ### Generate Occurrence Counts
+  number_of_occurrences <-ASV.nested %>%
+      dplyr::select(Step2.cleaned.tibble) %>%
+      unnest(Step2.cleaned.tibble) %>% # This stage is a long table
+      ungroup() %>%
+      group_by(seq_id) %>%
+      dplyr::count() # Count number of times ASVs are found across all samples
+
+  ### look at ASVs only found in negative controls (and not samples):
+  setdiff(negative_long$seq_id, number_of_occurrences$seq_id)
+  
+  ### look at taxa shared between ASVs found in negative control and samples:
+  intersect(negative_long$seq_id, number_of_occurrences$seq_id) %>% # which ASVs are shared?
+    as_tibble() %>%
+    dplyr::rename(seq_id = value) %>%
+    left_join(hash.key) # add taxa to ASVs 
+
+  ## Create column of whether or not an ASV was found in blanks or samples
+  number_of_occurrences <- number_of_occurrences %>%
+    mutate(Contam = if_else(seq_id %in% negative_long$seq_id, "In Negatives", "In Samples Only")) %>%
+    arrange(desc(n))
+
+} else {
+  message("Negative control not found - skipping analysis")
+  }
+
+```
+
+### Step 3.3: Which Species are in the blanks and what are their occurrences & read counts
+
+```{r warning=FALSE, message=FALSE}
+# Only run negatice control analysis if there's a negative control in samples:
+if ("Blank" %in% merged.table_long_v2$Control_Type) {
+  message("Negative control found — running code")
+  
+  ### Which Species are in the blanks and what are their occurrences & read counts
+   neg_comparison <- number_of_occurrences %>%
+    filter(., Contam == "In Negatives") %>% # only look at ASV occurrences found in negative controls
+    left_join(hash.key) %>% # merge ASV occurrence count with taxonomy
+    left_join(negative_reads) %>% # join occurence with sum of negative reads per ASV
+    left_join(read_counts_step3) %>% # join with summary of each ASV across all samples
+    mutate(., max_n = max(number_of_occurrences$n))
+
+  ### How would removing these ASVs change the number of results?
+  ASV.nested %>%
+    dplyr::select(Step2.cleaned.tibble) %>%
+    unnest(Step2.cleaned.tibble) %>% # pull out previous filter step counts
+    filter(., seq_id %in% neg_comparison$seq_id) %>% # select only ASVs in negative controls
+    group_by(seq_id) %>%
+    dplyr::summarise(
+      tot_reads_with_negASVs = sum(reads), # summarize reads for ASVs in neg control
+      mean_reads_with_negASVs = mean(reads), # mean of reads for ASVs in neg control
+      occurrences_with_negASVs = n_distinct(sample) # count how many times ASVs are found across all samples
+    )
+
+  ASV.nested %>%
+    dplyr::select(Step2.cleaned.tibble) %>%
+    unnest(Step2.cleaned.tibble) %>% # pull out previous filter step counts
+    filter(., !seq_id %in% neg_comparison$seq_id) %>% # select only ASVs not in negative controls
+    group_by(seq_id) %>%
+    dplyr::summarise(
+      tot_reads_without_negASVs = sum(reads), # summarize reads for ASVs not found in blanks
+      mean_reads_without_negASVs = mean(reads),  # mean of reads for ASVs not found in blanks
+      occurrences_without_negASVs = n_distinct(sample) # count how many times ASVs are found across all samples
+    )
+
+} else {
+  message("Negative control not found - skipping analysis")
+}
+
+```
+
+Plot of negative controls counts
+
+```{r warning=FALSE, message=FALSE}
+# Only run negatice control analysis if there's a negative control in samples:
+if ("Blank" %in% merged.table_long_v2$Control_Type) {
+  message("Negative control found — running code")
+  
+  ### Plot Occurrences
+  plot_occ <- number_of_occurrences %>% # plotting ASV occurence across samples
+    filter(., n > 5) %>% # only plot ASVs that occur in at least 6 samples
+    ggplot(., aes(x = reorder(seq_id, n), y = n, fill = Contam)) + # fill with Contam status (in neg control or only in sample)
+    geom_bar(
+      stat =
+        "identity"
+    ) +
+    facet_wrap(~Contam)
+
+  ggsave(
+    plot = plot_occ,
+    here(config_file$output_path,"Output_plots",
+         "step3_ASVs_from_Negative_Control_Occurrence_Plot.png"),
+    device = "png",
+    width = 12,
+    height = 8,
+    units = "in"
+  )
+
+} else {
+  message("Negative control not found - skipping analysis")
+}
+
+```
+
+### Step 3.3: Map List of ASVs Slated to be Removed
+
+```{r warning=FALSE, message=FALSE}
+# Only run negatice control analysis if there's a negative control in samples:
+if ("Blank" %in% merged.table_long_v2$Control_Type) {
+  message("Negative control found — running code")
+  
+  neg_comparison <- neg_comparison %>%
+  mutate(
+    .,
+    Neg_remove = case_when(
+      n < 10 ~ "To Remove", # if ASVs in negative controls only occur in less than 10 samples
+      n / max_n > .9 ~ "To Keep", # Keep any ASVs found within top 10 % of max occurrence of all blank ASVs
+      mean_reads - 2 * 1.96 * sd_reads > sum_reads_neg ~ "To Keep", # subtract the lower bounds of the 95% confidence interval of the normal distribution from the mean reads. If the mean reads are greater than this (within the normal distribution) and greater than the sum_reads_neg (reads in negative control) keep the ASV.
+      TRUE ~ "To Remove"
+    )
+  )
+
+} else {
+  message("Negative control not found - skipping analysis")
+}
+
+```
+
+### Step 3.4: Format and run for microDecon
+
+Create fake negative control for microDecon if not already present, and define data for adding to nested ASV data frame.
+
+```{r warning=FALSE, message=FALSE}
+##### Identify blank samples
+if (!is.null(ASV.nested$Blanks[[1]])) { # only run if negative controls in sample
+  message("Negative control found — running code")
+  blank_ASVs_1 <- ASV.nested$Blanks[[1]] %>% # Sample names and ASVs for blanks
+    dplyr::select(sample, seq_id, reads) # only keep selected columns
+  #### Number of Blanks
+  blank_num <- ASV.nested$Blanks[[1]]$sample %>%
+    unique() %>%
+    length()
+  #### Columns to Ignore for Grouping
+  blank_samples <- ASV.nested$Blanks[[1]]$sample %>% unique()
+} else { # If there are no blanks in samples, skip this step.
+  message("Negative control not found - skipping analysis")
+  #### Columns to Ignore for Grouping
+  blank_samples <- ASV.nested$Blanks[[1]]$sample %>% unique()
+}
+```
+
+Format dataframe for microDecon
+
+```{r warning=FALSE, message=FALSE}
+# Only run if negative control found:
+if (!is.null(ASV.nested$Blanks[[1]])) {
+  message("Negative control found — running code")
+  ##### Save previous steps to use for microDecon
+  step.2_barcode1 <- ASV.nested$Step2.cleaned.tibble[[1]]
+  #### Pivot to Wide format
+  step.2_barcode1_wide <- step.2_barcode1 %>%
+    dplyr::select(seq_id, reads, sample) %>% # select only necessary columns
+    pivot_wider( # pivot wider so read counts are now below each sample name
+      names_from = sample,
+      values_from = reads,
+      values_fill = list(reads = 0)
+    )
+
+  #### Arrange Blank Samples to be the first 3 columns
+  step.2_barcode1_wide <- step.2_barcode1_wide %>%
+    left_join(hash.key) %>% # add taxonomy
+    relocate(Taxon, .after = last_col()) %>% # move taxonomy to the end of the   dataframe
+    relocate(blank_samples, .after = seq_id) %>% # move blanks samples to the first three columns after the ASV column
+    as.data.frame()
+
+} else {
+  message("Negative control not found - skipping analysis")
+   ##### Save previous steps to use for microDecon
+  step.2_barcode1 <- ASV.nested$Step2.cleaned.tibble[[1]]
+}
+```
+
+Run (microDecontam)[https://github.com/donaldtmcknight/microDecon]
+
+```{r warning=FALSE, message=FALSE}
+# Only run if negative control found:
+if (!is.null(ASV.nested$Blanks[[1]])) {
+  message("Negative control found — running code")
+  #### Number of Samples (for decontam code)
+  sample_num<-ASV.nested$Step2.cleaned.tibble[[1]]$sample %>%
+    unique() %>%
+    length()
+
+  # columns to remove 
+  col_delete <- append(blank_samples, c("Taxon", "seq_id", "Miseq_region"))
+
+  #### Assign Groups -> should be replaced with pre-defined groups in the metadata file
+  if (config_file$step5_som_level == "double") { # assign groups of samples (if nested=double)
+  sample_counter <- colnames(step.2_barcode1_wide) %>%
+    as.data.frame() %>%
+    filter(., !(. %in% col_delete)) %>%
+    mutate(., New_name = .) %>%
+    left_join(metadata, join_by(New_name==samp_name)) %>%
+    dplyr::select(New_name, sample_derived_from, rep) %>%
+    distinct() %>%
+    group_by(Site, Bio_rep) %>%
+    dplyr::count()
+} else {
+    sample_counter <- colnames(step.2_barcode1_wide) %>%
+      as.data.frame() %>%
+      filter(., !(. %in% col_delete)) %>%
+      mutate(., samp_name = .) %>%
+      left_join(metadata, by = "samp_name") %>%
+      group_by(Sample_Control) %>%
+      dplyr::count()
+  }
+
+  step.3_barcode1_decon <- decon( # run microdecontam with settings from yaml:
+    data = step.2_barcode1_wide,
+    numb.blanks = blank_num,
+    numb.ind = sample_counter$n,
+    taxa = T,
+    runs = config_file$step3_runs,
+    thresh = config_file$step3_thresh,
+    prop.thresh = config_file$step3_prop.thresh,
+    regression = config_file$step3_regression
+  )
+
+  saveRDS(step.3_barcode1_decon,   here(config_file$output_path,"Output_R","step.3_barcode1_decon.RDS"))
+        
+  ### Convert to Long Data
+  columns <- colnames(step.3_barcode1_decon$decon.table)
+  remove <- c("seq_id", "Taxon")
+  # columns to gather in pivot longer
+  gathercols <- columns[!columns %in% remove]
+
+  # Save deconamtinated dataframe
+  step.3_barcode1_decon_clean <-
+    step.3_barcode1_decon$decon.table %>%
+    pivot_longer(.,
+      cols = gathercols,
+      names_to = "sample",
+      values_to = "reads"
+    )
+} else {
+  step.3_barcode1_decon_clean <- step.2_barcode1 %>%
+    left_join(hash.key, by="seq_id")
+  message("Negative control not found - skipping analysis")
+}
+  
+```
+
+### Step 3.5 Final Clean Up
+
+```{r warning=FALSE, message=FALSE}
+# format decontam output to create dataframe
+step.3_barcode1_decon_clean_tibble <- 
+  step.3_barcode1_decon_clean %>%
+    as_tibble() %>%
+    dplyr::select(-Taxon) %>%
+    filter(., !sample %in% c("Mean.blank", "fake_asv_1")) %>% # remove the fake blanks if they were added above
+    filter(., !seq_id == "fake_asv_1") %>% # remove the fake ASV if they were added above
+    filter(., reads > 0) %>%
+    filter(., !sample %in% blank_samples)
+
+##### Did any ASVs remain after microdecon?
+if (!is.null(ASV.nested$Blanks[[1]])) { # Only run if negative control exists
+  step.3_barcode1_decon_clean_tibble %>%
+    filter(., seq_id %in% negative_long$seq_id)
+
+  step.3_barcode1_decon_clean_tibble %>%
+    left_join(hash.key) %>%
+    filter(., Taxon %in% negative_long$Taxon) %>%
+    filter(., !sample %in% blank_samples) %>%
+    group_by(Taxon) %>%
+    dplyr::summarise(sum_reads = sum(reads))
+} else {
+  message("Negative control not found - not running check on microdecon output")
+}
+
+## Add to ASV.nested
+ASV.nested <- ASV.nested %>%
+  mutate(., Step3.tibble = list(step.3_barcode1_decon_clean_tibble))
+
+## Summary.file.3
+ASV.summary <- ASV.nested %>%
+  transmute(Miseq_region, Summary.3 = purrr::map(Step3.tibble, ~ how.many(ASVtable = ., round = "3.microDecon"))) %>%
+  left_join(ASV.summary) %>%
+  mutate(Summary = map2(Summary, Summary.3, bind_rows)) %>%
+  dplyr::select(-Summary.3)
+
+ASV.summary$Summary
+
+```
+
+## Step 4: Remove the positive and negative control samples.
+
+```{r warning=FALSE, message=FALSE}
+# Identify control samples
+samples_only <- merged.table_long_v2 %>% # orginal merged sample dataframe
+      filter(Control_Type!="Blank" & Control_Type!="Positive") # only samples (no negative or positive controls)
+
+## Filter out negative and positive control samples
+step.4_barcode1_removeCon_clean_tibble <- ASV.nested %>%
+    dplyr::select(Step3.tibble) %>% # pos contaminants removed tibble
+    unnest(Step3.tibble) %>% # unnest tibble to work with
+    filter(sample %in% samples_only$sample) # keep only negative control samples
+
+## Add to ASV.nested
+ASV.nested <- ASV.nested %>%
+  mutate(., Step4.tibble = list(step.4_barcode1_removeCon_clean_tibble))
+
+## Summary.file.4
+ASV.summary <- ASV.nested %>%
+  transmute(Miseq_region, Summary.4 = purrr::map(Step4.tibble, ~ how.many(ASVtable = ., round = "4.removecontrols"))) %>%
+  left_join(ASV.summary) %>%
+  mutate(Summary = map2(Summary, Summary.4, bind_rows)) %>%
+  dplyr::select(-Summary.4)
+
+ASV.summary$Summary
+
+```
+
+## Step 5: Cleaning Process 2: **Remove Likely Lab Contaminants**
+
+* Step 5.1: Remove any likely lab contaminants
+* Step 5.2: Filter reads by length (if 12S non-target seqs included)
+* Step 5.3: Remove off-target domains
+
+### Step 5.1
+
+
+Load known contaminant taxonomy 
+
+```{r warning=FALSE, message=FALSE}
+### Filter by Taxonomic Paths
+# This list can be expanded upon additional work to identify known contaminants within OME PMEL samples
+if (is.null(config_file$step5_species_to_remove_path)) {
+  step5_species_to_remove <- c(
+    "Harpagornis moorei",
+    "Pan paniscus",
+    "Primates",
+    "Sus scrofa",
+    "Bos",
+    "Homo",
+    "Gallus",
+    "Canis"
+  )
+} else {
+  step5_species_to_remove <- read.csv(here(config_file$step5_species_to_remove_path))$Taxon
+}
+
+```
+
+Remove contaminants from above
+
+```{r warning=FALSE, message=FALSE}
+# 1. Combine the patterns
+step5_species_to_remove_pattern <- paste(step5_species_to_remove, collapse = "|")
+
+# 2. Use str_detect() with the 'negate = TRUE' argument to filter out matches
+# filtered_strings <- str_subset(my_strings, pattern = combined_pattern, negate = TRUE)
+
+### Code to visualize
+known_contam_to_remove<-ASV.nested$Step4.tibble[[1]] %>% # previous output
+  left_join(.,hash.key) %>%
+  filter(Taxon %in% str_subset(Taxon, pattern=step5_species_to_remove_pattern, negate=TRUE)) # filter out contamination species
+# view dataframe:
+View(known_contam_to_remove)
+# save known comtaminants found:
+write_csv(known_contam_to_remove, file = here(config_file$output_path,"Output_csv","step5_known_contam_removed.csv"))
+
+## Add to ASV.nested
+ASV.nested <- ASV.nested %>%
+  mutate(
+    Step5.remove.known.contaminants.tibble = purrr::map( # add filtered out contaminants df to nested dataframe
+      Step4.tibble,
+      ~ left_join(., hash.key) %>%
+        filter(., !Taxon %in% step5_species_to_remove)
+    )
+  )
+
+## Summary.file.5
+ASV.summary <- ASV.nested %>%
+  transmute(Miseq_region,
+    Summary.5 = purrr::map( 
+      Step5.remove.known.contaminants.tibble, # add to summary file
+      ~ how.many(ASVtable = ., round = "5.labcontaminants")
+    )
+  ) %>%
+  left_join(ASV.summary) %>%
+  mutate(Summary = map2(Summary, Summary.5, bind_rows)) %>%
+  dplyr::select(-Summary.5)
+
+
+ASV.summary$Summary
+
+```
+
+### Step 5.2 filter by sequence length
+
+If 12S remove larger length region (bacteria) because we are targeting groups with shorter 12S.
+
+Create dataframe of ASVs to remove:
+
+```{r warning=FALSE}
+if (config_file$seq_length_filt=="Yes") {
+  message("Filtering ASVs by sequence length")
+# function to output sequence length from each file:
+  seq_len_df<- seq_len_df %>%
+    mutate(seq_length_flag=case_when(Seq_length <= 210 ~ "Target length",
+                                     TRUE ~ "Seq Length longer than 210bp"))
+  # save file of sequence length
+  write_csv(seq_len_df, 
+            here(config_file$output_path,"Output_csv","Step5.sequence_length_filt.csv"))
+  # list of ASVs to remove based on sequence length
+  seqs_to_keep<-seq_len_df %>% 
+    filter(Seq_length<=config_file$seq_length_max) # bacterial sequences longer for 12S.
+  # remove from ASVs:
+  ASV.nested <- ASV.nested %>%
+  mutate(
+    Step5.seqlength.filt.tibble = purrr::map( # add filtered out contaminants df to nested dataframe
+      Step5.remove.known.contaminants.tibble,
+      ~ left_join(., hash.key) %>%
+        filter(., seq_id %in% seqs_to_keep$seq_id)
+    )
+  )
+  # add to Summary file
+  ASV.summary <- ASV.nested %>%
+  transmute(Miseq_region,
+    Summary.5.seqLength = purrr::map( 
+      Step5.seqlength.filt.tibble, # add to summary file
+      ~ how.many(ASVtable = ., round = "5.seqlength")
+    )
+  ) %>%
+  left_join(ASV.summary) %>%
+  mutate(Summary = map2(Summary, Summary.5.seqLength, bind_rows)) %>%
+  dplyr::select(-Summary.5.seqLength)
+
+  ASV.summary$Summary
+
+  } else { # If any other region besides 12S
+    message("No sequence length filtering needed")
+    
+  }
+```
+
+
+### Step 5.3: Remove off-target domains
+
+- 12S: 'Bacteria','Archaea'
+- 18Sv4/18Sv9: 'Bacteria','Archaea'
+- COI: 'Bacteria','Archaea'
+- 16Sv4:
+- ITS1: 'Bacteria','Archaea'
+
+Create dataframe of these off-target Domains:
+```{r warning=FALSE}
+# Domains to filter out:
+metabar_off_target<-data.frame(
+                        metabar_region = c("12S","12S","18Sv4","18Sv4","18Sv9","18Sv9",
+                                           "COI","COI","ITS1","ITS1"),
+                        Domain=c("Bacteria","Archaea","Bacteria","Archaea","Bacteria","Archaea",
+                                 "Bacteria","Archaea","Bacteria","Archaea")) %>%
+  filter(metabar_region==config_file$region)
+# Taxonomy to filter everything else out by:
+metabar_taxa_only<-data.frame(metabar_region = "12S", taxa_level= "Phylum", taxa_id="Chordata") %>%
+  filter(metabar_region==config_file$region)
+
+```
+
+Filter out off-target based on region:
+
+```{r warning=FALSE}
+if (config_file$seq_length_filt=="Yes") {
+  message("Starting from Step5.seqlength.filt.tibble")
+  # remove off-target contaminants:
+  ASV.nested <- ASV.nested %>%
+  mutate(
+    Step5.non.target = purrr::map( # add filtered out contaminants df to nested dataframe
+      Step5.seqlength.filt.tibble,
+      ~ left_join(., seq_id) %>%
+        separate_wider_delim(sum.taxonomy, delim = ";",
+                         names = c("Domain","Phylum","Class","Order","Family","Genus","Species"), 
+                         # Specify new column names
+                         too_few = "align_start", # How to handle rows with fewer values
+                         too_many = "drop", # How to handle rows with more values
+      cols_remove = FALSE) %>%
+    # remove known positive control species and genus:
+    filter(., !Domain %in% metabar_off_target$Domain) %>%
+    filter(., !!sym(metabar_taxa_only$taxa_level) %in% metabar_taxa_only$taxa_id) %>%
+      dplyr::select(-c("Domain","Phylum","Class","Order","Family","Genus","Species"))
+    )
+  )
+ 
+  } else { # If any other region besides 12S
+    message("Starting from Step5.remove.known.contaminants.tibble")
+    # remove off-target contaminants:
+    ASV.nested <- ASV.nested %>%
+    mutate(
+      Step5.non.target = purrr::map( # add filtered out contaminants df to nested dataframe
+        Step5.remove.known.contaminants.tibble,
+        ~ left_join(., seq_id) %>%
+          separate_wider_delim(sum.taxonomy, delim = ";",
+                           names = c("Domain","Phylum","Class","Order","Family","Genus","Species"), 
+                           # Specify new column names
+                           too_few = "align_start", # How to handle rows with fewer values
+                           too_many = "drop", # How to handle rows with more values
+        cols_remove = FALSE) %>%
+      # remove known positive control species and genus:
+      filter(., !Domain %in% metabar_off_target$Domain) %>%
+      filter(., !!sym(metabar_taxa_only$taxa_level) %in% metabar_taxa_only$taxa_id) %>%
+        dplyr::select(-c("Domain","Phylum","Class","Order","Family","Genus","Species"))
+      )
+    )
+    
+  }
+```
+
+```{r warning=FALSE}
+# add to Summary file
+  ASV.summary <- ASV.nested %>%
+  transmute(Miseq_region,
+    Summary.5.offTarget = purrr::map( 
+      Step5.non.target, # add to summary file
+      ~ how.many(ASVtable = ., round = "5.offTarget")
+    )
+  ) %>%
+  left_join(ASV.summary) %>%
+  mutate(Summary = map2(Summary, Summary.5.offTarget, bind_rows)) %>%
+  dplyr::select(-Summary.5.offTarget)
+
+  print.data.frame(as.data.frame(ASV.summary$Summary))
+  
+ ASV.nested %>%
+    dplyr::select(Step5.seqlength.filt.tibble) %>% # pos contaminants removed tibble
+    unnest(Step5.seqlength.filt.tibble)
+
+```
+
+## Final formatting of files before moving to Part II
+
+```{r warning=FALSE, message=FALSE}
+# Save summary and nested data
+saveRDS(ASV.nested, file = here(config_file$output_path,"Output_R","ASV.nested_final_partI.RDS"))
+saveRDS(ASV.summary, file = here(config_file$output_path,"Output_R","ASV.summary_final_partI.RDS"))
+
+# save final files
+# ASVs and fasta combined
+partI_ASV_final_output <- ASV.nested %>%
+  dplyr::select(Step5.remove.known.contaminants.tibble) %>% 
+    unnest(Step5.remove.known.contaminants.tibble) %>%
+  unique() %>%
+    pivot_wider( # pivot wider so read counts are now below each sample name
+      names_from = sample,
+      values_from = reads,
+      values_fill = list(reads = 0)
+    )
+# metadata file:
+partI_meta_final_output <- metadata %>%
+  filter(samp_name %in% names(partI_ASV_final_output))
+
+# save metadata and asv file:
+write_csv(partI_ASV_final_output, file = here(config_file$output_path,"Output_csv","asv_final_partI.csv"))
+write_csv(partI_meta_final_output, file = here(config_file$output_path,"Output_csv","meta_final_partI.csv"))
+
+```
+
+#### Software and package versions used for file:
+
+```{r warning=FALSE}
+print(sessionInfo(), locale = FALSE)
+```

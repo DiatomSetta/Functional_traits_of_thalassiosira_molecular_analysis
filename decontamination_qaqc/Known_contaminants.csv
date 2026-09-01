@@ -1,0 +1,21 @@
+taxa_level,taxa_id,sum.taxonomy,notes
+Genus,Harpagornis,Eukaryota;Chordata;Aves;Accipitriformes;Accipitridae;Harpagornis;Harpagornis moorei,OME lab positive control
+Family,Hominidae,Eukaryota;Chordata;Mammalia;Primates;Hominidae;Pan;Pan paniscus,known lab contaminant
+Order,Primates,Eukaryota;Chordata;Mammalia;Primates;NA;NA;NA,known lab contaminant
+Family,Suidae,Eukaryota;Chordata;Mammalia;Artiodactyla;Suidae;Sus;Sus scrofa,known lab contaminant
+Family,Bovidae,Eukaryota;Chordata;Mammalia;Artiodactyla;Bovidae;Bos;Bos taurus,known lab contaminant
+Family,Hominidae,Eukaryota;Chordata;Mammalia;Primates;Hominidae;Homo;Homo sapiens,known lab contaminant
+Genus,Gallus,Eukaryota;Chordata;Aves;Galliformes;Phasianidae;Gallus;Gallus gallus,known lab contaminant
+Family,Canidae,Eukaryota;Chordata;Mammalia;Carnivora;Canidae;Canis;Canis lupus,known lab contaminant
+Family,Camelidae,Eukaryota;Chordata;Mammalia;Artiodactyla;Camelidae;Camelus;Camelus dromedarius,OME lab positive control
+Species,Luticola ventricosa,Eukaryota;Bacillariophyta;Bacillariophyceae;Naviculales;Diadesmidaceae;Luticola;Luticola ventricosa,OME lab positive control
+Species,Halocafeteria seosinensis,Eukaryota;Bigyra__p;Bigyra;Bicosoecida;Halocafeteria__f;Halocafeteria;Halocafeteria seosinensis,OME lab positive control
+Genus,Dinornis,Eukaryota;Chordata;Aves;Dinornithiformes;Dinornithidae;Dinornis;Dinornis novaezealandiae,OME lab positive control
+Genus,Euryapteryx,Eukaryota;Chordata;Aves;Dinornithiformes;Emeidae;Euryapteryx;Euryapteryx curtus,OME lab positive control
+Species,Orcaella brevirostris,Eukaryota;Chordata;Mammalia;Artiodactyla;Delphinidae;Orcaella;Orcaella brevirostris,OME lab positive control
+Genus,Raphus,Eukaryota;Chordata;Aves;Columbiformes;Raphidae;Raphus;Raphus cucullatus,OME lab positive control
+Species,Sebastes inermis,Eukaryota;Chordata;Actinopteri;Perciformes;Sebastidae;Sebastes;Sebastes inermis,OME lab positive control
+Genus,Coelodonta,Eukaryota;Chordata;Mammalia;Perissodactyla;Rhinocerotidae;Coelodonta;Coelodonta antiquitatis,OME lab positive control
+Genus,Hydrodamalis,Eukaryota;Chordata;Mammalia;Sirenia;Dugongidae;Hydrodamalis;Hydrodamalis gigas,OME lab positive control
+Genus,Smilodon,Eukaryota;Chordata;Mammalia;Carnivora;Felidae;Smilodon;Smilodon populator,OME lab positive control
+Genus,Megatherium,Eukaryota;Chordata;Mammalia;Pilosa;Megatheriidae;Megatherium;Megatherium americanum,OME lab positive control

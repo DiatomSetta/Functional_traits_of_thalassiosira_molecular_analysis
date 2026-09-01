@@ -1,0 +1,52 @@
+---
+title: "OME Run4 Decontam and QAQC"
+author: "Sam Setta"
+date: "`Sys.Date()`"
+
+# Part I
+# metabarcoding region:
+region: "18Sv4"
+# sequencing run:
+run: "run4"
+
+# Input file paths for REVAMP Formatted ASV data, fasta sequences, and taxonomy.
+parent_dir: "/Users/setta/Documents/SKQ_AlaskaCruises/SKQ_Alaska_Analysis"
+input_ASV_path_1: "/Users/setta/Documents/SKQ_AlaskaCruises/SKQ_Alaska_Analysis/SKQ_Alaska_data/processed/otuRaw_ssu18sv4_stoeck_pmel_ome_run4.csv"
+input_fasta_path_1: "/Users/setta/Documents/SKQ_AlaskaCruises/SKQ_Alaska_Analysis/SKQ_Alaska_data/raw/Run4_18Sv4_ASVs.fa"
+input_taxonomy_path_1: "/Users/setta/Documents/SKQ_AlaskaCruises/SKQ_Alaska_Analysis/SKQ_Alaska_data/raw/Run4_18Sv4_tax_pr2_sklearn.tsv"
+taxonomy_format: "nine_level" # options either nine_level or seven_level
+# note: need to make sure column headers in readTrimSummary file are correct before loading into R. (sample column likely needs header)
+
+# Path to the metadata file. Please see detailed instructions on formatting and required columns
+input_meta_path: "/Users/setta/Documents/SKQ_AlaskaCruises/SKQ_Alaska_Analysis/SKQ_Alaska_data/processed/run4_faire.csv"
+
+# Path to the output path file. Please see detailed instructions on formatting and required columns
+output_path: "/Users/setta/Documents/SKQ_AlaskaCruises/SKQ_Alaska_Analysis/SKQ_Alaska_data/processed/decontam_QAQC/18Sv4"
+
+# Part I processing steps
+
+# Step 2: Taxonomic path for known positive control species.
+# Full taxonomic string of known positive control species. May need to adjust if the classifier can not resolve species level.
+step1_positive_species_taxonomic_path: "Eukaryota;TSAR;Stramenopiles;Gyrista;Bacillariophyceae;Naviculales;Diadesmidaceae;Luticola;Luticola_ventricosa"
+step1_positive_lowest_taxonomic_lvl: "Genus"
+step1_positive_lowest_taxonomic_lvl_id: "Luticola"
+
+# Number of Anacapa tables (currently set to "single" for a single run).
+# number_anacapa_tables: "single"
+
+# Step 3: Parameters for microDecon (number of runs, thresholds, regression).
+step3_runs: 2 # ideal number of runs is 2 unless you expect more contamination
+# The thresh term used in step 3 for microDecon. See microDecon for detailed instructions. https://github.com/donaldtmcknight/microDecon
+step3_thresh: 0.7 # The proportion of samples for which a give ASV is zero, default is 0.7. If 70% of ASVs in a group of samples is zero the remaining samples in the group will be set to zero
+# The prop.thresh term used in step 3 for microDecon. See microDecon for detailed instructions. https://github.com/donaldtmcknight/microDecon
+step3_prop.thresh: 5e-05 # 0.00005 is the default, if proportion of reads for an ASV in a group of samples is less than 0.005% the ASV for that group will be set to zero.
+# The regression term used in step 3 for microDecon. See microDecon for detailed instructions. https://github.com/donaldtmcknight/microDecon
+step3_regression: 0 # 0 is default based on simulations, 1 is more simplistic and consistent and is a good alternative too.
+
+# Step 4: Path to a file listing species to remove as known lab contaminants.
+# Set to null if using hard-coded list within the script. Otherwise provide a CSV file with a column titled "sum.taxonomy" that includes all relevant strings.
+step5_species_to_remove_path: "/Users/setta/Documents/SKQ_AlaskaCruises/SKQ_Alaska_Analysis/SKQ_Alaska_data/processed/decontam_QAQC/Known_contaminants.csv"
+# Do you want to filter by sequence length? ("Yes" or "No")
+seq_length_filt: "No"
+# If filt by sequence length what is the length above which you want to filter out sequences
+seq_length_max: NA
