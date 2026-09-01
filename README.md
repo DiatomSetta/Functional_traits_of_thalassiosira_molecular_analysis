@@ -2,10 +2,10 @@
 Scripts and log files from molecular analysis of 5 samples on the Dyson 2022 EcoFOCI Spring mooring cruise
 
 ### Files included in repository:
-- config file for REVAMP input (includes parameters for filtering and DADA2 input)
-- code for pr2 taxonomic classifier training and taxonomic classification with qiime2 and scikitlearn
-- decontamination and quality assurance code
-- R markdown + html file of analysis
+- config file for REVAMP input (includes parameters for filtering and DADA2 input) (`18Sv4_revamp_config_file.txt`)
+- code for pr2 taxonomic classifier training and taxonomic classification with qiime2 and scikitlearn (`Taxonomy_pr2_v5.1.0_scikitlearn_code.md`)
+- decontamination and quality assurance code (`decontamination_qaqc`)
+- R markdown + html file of analysis (`manuscript_molecular_analysis`)
 
 ### Disclaimer
 This repository is a scientific product and is not official communication of the National Oceanic and
