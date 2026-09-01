@@ -1,0 +1,30 @@
+##This is the MetaPipe config file
+
+####################################################
+##Frequently modified parameters
+####################################################
+primerF=CCAGCASCYGCGGTAATTCC
+primerR=ACTTTCGTTCTTGATYR
+blastQueryCovCutoff=90 #bp length cutoff
+systemmemoryMB=320000
+# ncbi blast db from 12/26/2024
+locationNTdatabase=/data/blastdb/2025_dbs/20241226_nt_db
+taxonomyCutoffs=97,95,90,80,70,60 #Percent ID cutoffs for ID to species,genus,etc
+
+###DADA2 Filtering options:
+dada_minlength=100
+dada_phix=TRUE
+dada_trunQ=2
+dada_maxEE1=2
+dada_maxEE2=2
+dada_trimRight=10
+dada_trimLeft=0
+###
+
+####################################################
+##Infrequently changed default parameters
+####################################################
+blastMode=mostEnvOUT
+silva_db_release=138.2
+asv_method=dada2pe
+
